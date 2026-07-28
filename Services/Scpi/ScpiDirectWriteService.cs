@@ -35,17 +35,6 @@ public sealed class ScpiDirectWriteService(
         await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
         var mapping = await db.RedisMappings.AsNoTracking()
             .FirstOrDefaultAsync(item => item.SourcePath == sourcePath, cancellationToken);
-        if (mapping is null)
-        {
-            return Failure(ScpiErrorCodes.PointNotFound, $"No RedisMapping exists for '{sourcePath}'.");
-        }
-
-        if (!runtime.IsRedisOutputReady)
-        {
-            return Failure(
-                ScpiErrorCodes.EndpointUnavailable,
-                "Redis output startup requirements are not ready; current ownership cannot be verified.");
-        }
 
         var point = await db.ScpiPointConfigs.AsNoTracking()
             .Include(item => item.EnumOptions)
@@ -82,19 +71,22 @@ public sealed class ScpiDirectWriteService(
                 point.EndpointConfig.EndpointId,
                 async token =>
                 {
-                    if (!runtime.IsRedisOutputReady)
+                    if (runtime.IsRedisOutputReady)
                     {
-                        throw new ScpiValidationException(
-                            ScpiErrorCodes.EndpointUnavailable,
-                            "Redis output startup requirements changed before the direct write could start.");
-                    }
+                        if (mapping is null)
+                        {
+                            throw new ScpiValidationException(
+                                ScpiErrorCodes.PointNotFound,
+                                $"No RedisMapping exists for '{sourcePath}', so ownership cannot be verified.");
+                        }
 
-                    var claim = await ownership.ClaimAsync(mapping.SourcePath, mapping.RedisKey, token);
-                    if (!claim.Acquired)
-                    {
-                        throw new ScpiValidationException(
-                            ScpiErrorCodes.OwnershipNotAcquired,
-                            $"This RedisScpi instance does not own '{sourcePath}'.");
+                        var claim = await ownership.ClaimAsync(mapping.SourcePath, mapping.RedisKey, token);
+                        if (!claim.Acquired)
+                        {
+                            throw new ScpiValidationException(
+                                ScpiErrorCodes.OwnershipNotAcquired,
+                                $"This RedisScpi instance does not own '{sourcePath}'.");
+                        }
                     }
 
                     return await client.DirectWriteWithinEndpointLockAsync(

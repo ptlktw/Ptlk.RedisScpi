@@ -24,6 +24,10 @@ public sealed class RedisPointOwnershipService(
     private static readonly TimeSpan ClaimRefreshInterval = TimeSpan.FromSeconds(5);
 
     private const string ClaimScript = """
+        if redis.call('EXISTS', KEYS[2]) == 1
+            and redis.call('HEXISTS', KEYS[2], 'retirement_token') == 1 then
+            return {'edge_retiring'}
+        end
         if redis.call('EXISTS', KEYS[1]) == 0 then
             return {'missing'}
         end
@@ -122,7 +126,7 @@ public sealed class RedisPointOwnershipService(
             var timestamp = checkedAt.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture);
             var result = (RedisResult[]?)await database.ScriptEvaluateAsync(
                 ClaimScript,
-                [redisKey],
+                [redisKey, $"edge:{options.Value.ConverterId}"],
                 [options.Value.ConverterId, options.Value.SourceName, timestamp]);
             var status = result is { Length: > 0 }
                 ? result[0].ToString() ?? ""

@@ -17,6 +17,7 @@ public sealed class CommandExecutionService(
     IDbContextFactory<AppDbContext> dbFactory,
     IRedisPubSubService pubSub,
     RedisPointOwnershipService ownership,
+    RedisReconciliationService reconciliation,
     RedisPointStateService pointState,
     IScpiClientService scpi,
     EndpointOperationScheduler scheduler,
@@ -69,6 +70,21 @@ public sealed class CommandExecutionService(
                 "converter_not_responsible",
                 $"Endpoint '{endpoint.EndpointId}' belongs to converter '{endpoint.ConverterId}'.");
             return new CommandDispatchResult("ignored", "The endpoint belongs to another RedisScpi converter.", command.CommandId);
+        }
+
+        if (!reconciliation.IsReady)
+        {
+            var pendingClaim = await ClaimAsync(command, canonicalPayload, cancellationToken);
+            if (!pendingClaim.Winner)
+            {
+                return await HandleDuplicateAsync(command, canonicalPayload, pendingClaim.Execution, cancellationToken);
+            }
+
+            return await FinishFailedAsync(
+                command,
+                "redis_output_not_ready",
+                "Redis reconciliation is pending.",
+                cancellationToken);
         }
 
         if (!runtime.IsRedisOutputReady
@@ -225,7 +241,7 @@ public sealed class CommandExecutionService(
         {
             if (ex.CommandWasSent)
             {
-                await UpdateBadAfterVerificationFailureAsync(target, point, ex, cancellationToken);
+                await UpdateBadAfterVerificationFailureAsync(target, point, command.CommandId, ex, cancellationToken);
             }
             return CommandOperationOutcome.Failed(ex.ErrorCode, ex.Message);
         }
@@ -242,7 +258,9 @@ public sealed class CommandExecutionService(
                 writeResult.ActualValue.JsonValue,
                 ScpiQuality.Good,
                 redisScpiOptions.Value.SourceName,
-                cancellationToken);
+                cancellationToken,
+                PointUpdateReasons.CommandWrite,
+                command.CommandId);
             cache.SetGood(
                 point.SourcePath,
                 endpoint.EndpointId,
@@ -495,6 +513,7 @@ public sealed class CommandExecutionService(
     private async Task UpdateBadAfterVerificationFailureAsync(
         ResolvedCommandTarget target,
         ScpiPointConfig point,
+        string commandId,
         ScpiWriteOperationException exception,
         CancellationToken cancellationToken)
     {
@@ -506,7 +525,9 @@ public sealed class CommandExecutionService(
                 null,
                 ScpiQuality.Bad,
                 redisScpiOptions.Value.SourceName,
-                cancellationToken);
+                cancellationToken,
+                PointUpdateReasons.CommandWrite,
+                commandId);
             cache.SetBad(
                 point.SourcePath,
                 point.EndpointConfig!.EndpointId,

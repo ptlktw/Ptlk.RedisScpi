@@ -7,12 +7,15 @@ namespace Ptlk.RedisScpi.Services.Startup;
 
 public sealed class RedisScpiStatusService(
     RuntimeModeService runtime,
-    IRedisPubSubService pubSub,
+    EdgeStatePublisher edgeState,
     RedisPointOwnershipService ownership,
+    RedisReconciliationService reconciliation,
     IOptions<RedisScpiOptions> redisScpiOptions,
     IOptions<RedisScpiRuntimeOptions> runtimeOptions,
     ILogger<RedisScpiStatusService> logger) : BackgroundService
 {
+    private readonly string instanceId = Guid.NewGuid().ToString("N");
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         await PublishAsync("RedisProtocolConverter.online", "online", stoppingToken);
@@ -50,10 +53,12 @@ public sealed class RedisScpiStatusService(
             var runtimeDiagnostics = current.RuntimeDiagnostics;
             var metadata = new Dictionary<string, string?>
             {
+                ["instanceId"] = instanceId,
                 ["mode"] = current.Mode.ToString(),
                 ["message"] = current.Message,
                 ["redisConnected"] = BoolText(current.RedisConnected),
                 ["assetInitialized"] = BoolText(current.AssetInitialized),
+                ["reconciliation"] = reconciliation.Status,
                 ["redisOutputStatus"] = current.RedisOutputStatus.ToString(),
                 ["redisOutputMessage"] = current.RedisOutputMessage,
                 ["redisOutputDiagnosticsCount"] = current.RedisOutputDiagnostics.Count.ToString(),
@@ -87,7 +92,7 @@ public sealed class RedisScpiStatusService(
                 Source: options.SourceName,
                 Metadata: metadata);
 
-            await pubSub.PublishAsync(RedisContractNames.EdgeStatusChannel, evt, cancellationToken);
+            await edgeState.PublishAsync(evt, runtimeOptions.Value.HeartbeatIntervalMs, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

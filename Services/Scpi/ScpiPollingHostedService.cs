@@ -16,6 +16,7 @@ public sealed class ScpiPollingHostedService(
     ScpiValueCache cache,
     ScpiQualityPolicy qualityPolicy,
     RedisPointOwnershipService ownership,
+    RedisReconciliationService reconciliation,
     RedisPointStateService pointState,
     RuntimeModeService runtime,
     IOptions<RedisScpiOptions> redisScpiOptions,
@@ -102,35 +103,7 @@ public sealed class ScpiPollingHostedService(
                     continue;
                 }
 
-                if (!configuration.Mappings.TryGetValue(point.SourcePath, out var mapping))
-                {
-                    cache.MarkStale(point.SourcePath, "A RedisMapping is required before polling.");
-                    runtime.ReportRuntimeDiagnostic(
-                        "mapping",
-                        point.SourcePath,
-                        "missing_mapping",
-                        $"Polling is waiting for a RedisMapping for '{point.SourcePath}'.");
-                    continue;
-                }
-                runtime.ClearRuntimeDiagnostic("mapping", point.SourcePath);
-
-                if (!runtime.IsRedisOutputReady)
-                {
-                    cache.MarkStale(point.SourcePath, "Redis output gate is not ready.");
-                    continue;
-                }
-
-                if (!await ownership.EnsureOwnedAsync(point.SourcePath, mapping.RedisKey, cancellationToken))
-                {
-                    cache.MarkStale(point.SourcePath, "Ownership is not held by this RedisScpi instance.");
-                    runtime.ReportRuntimeDiagnostic(
-                        "ownership",
-                        point.SourcePath,
-                        ScpiErrorCodes.OwnershipNotAcquired,
-                        "Polling did not access the device because point ownership is not held.");
-                    continue;
-                }
-                runtime.ClearRuntimeDiagnostic("ownership", point.SourcePath);
+                configuration.Mappings.TryGetValue(point.SourcePath, out var mapping);
 
                 endpointFailure = await scheduler.RunAsync(
                     endpoint.EndpointId,
@@ -143,29 +116,50 @@ public sealed class ScpiPollingHostedService(
     private async Task<bool> PollPointWithinEndpointLockAsync(
         ScpiEndpointConfig endpoint,
         ScpiPointConfig point,
-        RedisMapping mapping,
+        RedisMapping? mapping,
         IReadOnlyDictionary<string, RedisMapping> mappings,
         CancellationToken cancellationToken)
     {
         try
         {
-            var currentClaim = await ownership.ClaimAsync(
-                mapping.SourcePath,
-                mapping.RedisKey,
-                cancellationToken);
-            if (!currentClaim.Acquired)
+            var result = await client.ReadWithinEndpointLockAsync(endpoint, point, cancellationToken);
+            var cached = cache.SetGood(
+                point.SourcePath,
+                endpoint.EndpointId,
+                point.PointId,
+                result.ConvertedValue.JsonValue,
+                result.ConvertedValue.RedisValue,
+                "poll",
+                FormatResponses(result.RawResponse, result.ErrorQueueResponse));
+            runtime.ClearRuntimeDiagnostic("polling", point.SourcePath);
+            runtime.ClearRuntimeDiagnostic("transport", endpoint.EndpointId);
+            RestoreHealthySubsystemStatus();
+
+            if (mapping is null)
             {
-                cache.MarkStale(point.SourcePath, "Ownership changed before the scheduled poll could start.");
+                runtime.ReportRuntimeDiagnostic(
+                    "mapping",
+                    point.SourcePath,
+                    "missing_mapping",
+                    $"SCPI acquisition is active; Redis projection awaits a mapping for '{point.SourcePath}'.");
+                return false;
+            }
+            runtime.ClearRuntimeDiagnostic("mapping", point.SourcePath);
+            if (!reconciliation.IsReady)
+            {
+                return false;
+            }
+            if (!await ownership.EnsureOwnedAsync(point.SourcePath, mapping.RedisKey, cancellationToken))
+            {
                 runtime.ReportRuntimeDiagnostic(
                     "ownership",
                     point.SourcePath,
                     ScpiErrorCodes.OwnershipNotAcquired,
-                    "Polling did not access the device because ownership changed while waiting for the endpoint lock.");
+                    "SCPI acquisition succeeded; Redis projection was skipped because ownership is not held.");
                 return false;
             }
             runtime.ClearRuntimeDiagnostic("ownership", point.SourcePath);
 
-            var result = await client.ReadWithinEndpointLockAsync(endpoint, point, cancellationToken);
             try
             {
                 await pointState.UpdateDynamicFieldsAsync(
@@ -173,25 +167,19 @@ public sealed class ScpiPollingHostedService(
                     result.ConvertedValue.JsonValue,
                     ScpiQuality.Good,
                     redisScpiOptions.Value.SourceName,
-                    cancellationToken);
-                cache.SetGood(
-                    point.SourcePath,
-                    endpoint.EndpointId,
-                    point.PointId,
-                    result.ConvertedValue.JsonValue,
-                    result.ConvertedValue.RedisValue,
-                    "poll",
-                    FormatResponses(result.RawResponse, result.ErrorQueueResponse));
-                runtime.ClearRuntimeDiagnostic("polling", point.SourcePath);
-                runtime.ClearRuntimeDiagnostic("transport", endpoint.EndpointId);
+                    cancellationToken,
+                    timestamp: cached.UpdatedAt.ToUnixTimeMilliseconds());
                 runtime.ClearRedisOutputDiagnosticsForMapping(mapping.SourcePath, mapping.RedisKey);
-                RestoreHealthySubsystemStatus();
             }
             catch (RedisPointStateException ex)
             {
                 if (IsOwnershipFailure(ex))
                 {
-                    cache.MarkStale(point.SourcePath, "Ownership was lost before the Redis state update.");
+                    runtime.ReportRuntimeDiagnostic(
+                        "ownership",
+                        point.SourcePath,
+                        ScpiErrorCodes.OwnershipNotAcquired,
+                        "SCPI acquisition succeeded; ownership changed before Redis projection.");
                 }
                 runtime.ReportRedisOutputDiagnostic(
                     "polling",
@@ -232,13 +220,8 @@ public sealed class ScpiPollingHostedService(
         runtime.ReportRuntimeDiagnostic("transport", endpoint.EndpointId, failure.ErrorCode, exception.Message);
         foreach (var point in endpoint.Points.Where(point => point.Enabled && point.PollingEnabled))
         {
-            if (!mappings.TryGetValue(point.SourcePath, out var mapping) || !ownership.IsOwned(point.SourcePath))
-            {
-                cache.MarkStale(point.SourcePath, "Endpoint failed and ownership is not held.");
-                continue;
-            }
-
-            await MarkPointBadAsync(endpoint, point, mapping, failure, exception, cancellationToken);
+            mappings.TryGetValue(point.SourcePath, out var mapping);
+            await MarkPointBadAsync(endpoint, point, mapping, failure, exception, cancellationToken, preserveLastValue: true);
             var interval = TimeSpan.FromMilliseconds(point.PollingIntervalMs ?? endpoint.PollingIntervalMs);
             _nextDue[point.SourcePath] = DateTimeOffset.UtcNow.Add(interval);
         }
@@ -247,30 +230,48 @@ public sealed class ScpiPollingHostedService(
     private async Task MarkPointBadAsync(
         ScpiEndpointConfig endpoint,
         ScpiPointConfig point,
-        RedisMapping mapping,
+        RedisMapping? mapping,
         ScpiFailureClassification failure,
         Exception exception,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool preserveLastValue = false)
     {
         runtime.SetPolling(RuntimeSubsystemStatus.Degraded, $"Polling failed for '{point.SourcePath}'.");
         runtime.ReportRuntimeDiagnostic("polling", point.SourcePath, failure.ErrorCode, exception.Message);
         var rawContext = RawContext(exception);
+        var cached = cache.SetBad(
+            point.SourcePath,
+            endpoint.EndpointId,
+            point.PointId,
+            "poll",
+            rawContext,
+            failure.ErrorCode,
+            exception.Message,
+            preserveLastValue);
+
+        if (mapping is null || !reconciliation.IsReady)
+        {
+            return;
+        }
+        if (!await ownership.EnsureOwnedAsync(point.SourcePath, mapping.RedisKey, cancellationToken))
+        {
+            runtime.ReportRuntimeDiagnostic(
+                "ownership",
+                point.SourcePath,
+                ScpiErrorCodes.OwnershipNotAcquired,
+                "SCPI failure was cached; Redis projection was skipped because ownership is not held.");
+            return;
+        }
         try
         {
             await pointState.UpdateDynamicFieldsAsync(
                 mapping,
-                null,
+                cached.Value,
                 ScpiQuality.Bad,
                 redisScpiOptions.Value.SourceName,
-                cancellationToken);
-            cache.SetBad(
-                point.SourcePath,
-                endpoint.EndpointId,
-                point.PointId,
-                "poll",
-                rawContext,
-                failure.ErrorCode,
-                exception.Message);
+                cancellationToken,
+                PointUpdateReasons.AcquisitionFailure,
+                timestamp: cached.UpdatedAt.ToUnixTimeMilliseconds());
         }
         catch (RedisPointStateException redisException)
         {

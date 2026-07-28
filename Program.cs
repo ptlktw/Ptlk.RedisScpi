@@ -38,8 +38,17 @@ builder.Services.AddSingleton<RuntimeModeService>();
 builder.Services.AddSingleton<RedisConnectionFactory>();
 builder.Services.AddSingleton<RedisPubSubService>();
 builder.Services.AddSingleton<IRedisPubSubService>(provider => provider.GetRequiredService<RedisPubSubService>());
+builder.Services.AddSingleton<EdgeStatePublisher>();
 builder.Services.AddSingleton<RedisPointOwnershipService>();
-builder.Services.AddSingleton<RedisPointStateService>();
+builder.Services.AddSingleton<AtomicPointUpdateService>();
+builder.Services.AddSingleton<PointUpdateIdentity>();
+builder.Services.AddSingleton<RedisPointStateService>(provider => new RedisPointStateService(
+    provider.GetRequiredService<RedisConnectionFactory>(),
+    provider.GetRequiredService<AtomicPointUpdateService>(),
+    provider.GetRequiredService<PointUpdateIdentity>(),
+    provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<RedisScpiOptions>>(),
+    provider.GetRequiredService<RuntimeModeService>()));
+builder.Services.AddSingleton<RedisReconciliationService>();
 builder.Services.AddSingleton<RedisKeySuggestionService>();
 
 builder.Services.AddSingleton<ScpiSourcePathService>();
@@ -68,6 +77,7 @@ builder.Services.AddScoped<ScreenAlertService>();
 
 builder.Services.AddHostedService<StartupGateService>();
 builder.Services.AddHostedService<RedisPointOwnershipHostedService>();
+builder.Services.AddHostedService(provider => provider.GetRequiredService<RedisReconciliationService>());
 builder.Services.AddHostedService<RedisScpiStatusService>();
 builder.Services.AddHostedService<ScpiPollingHostedService>();
 builder.Services.AddHostedService<DeviceCommandSubscriptionService>();

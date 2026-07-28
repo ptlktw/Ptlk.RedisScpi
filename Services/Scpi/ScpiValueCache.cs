@@ -16,22 +16,43 @@ public sealed record ScpiCachedValue(
     string? ErrorCode,
     string? ErrorMessage,
     bool Stale,
-    string? StaleReason);
+    string? StaleReason,
+    long Sequence = 0);
 
 public sealed class ScpiValueCache
 {
     private readonly ConcurrentDictionary<string, ScpiCachedValue> _values =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _sync = new();
+    private long _sequence;
+    private long _outageBoundary;
+    private bool _outageActive = true;
 
     public event Action? Changed;
 
-    public void Set(ScpiCachedValue value)
+    public ScpiCachedValue Set(ScpiCachedValue value)
     {
-        _values[value.SourcePath] = value;
+        ScpiCachedValue updated;
+        lock (_sync)
+        {
+            if (value.Quality == Contracts.Scpi.ScpiQuality.Bad
+                && _values.TryGetValue(value.SourcePath, out var current)
+                && string.Equals(current.RedisValue, value.RedisValue, StringComparison.Ordinal)
+                && current.Quality == value.Quality
+                && string.Equals(current.ErrorCode, value.ErrorCode, StringComparison.Ordinal)
+                && string.Equals(current.ErrorMessage, value.ErrorMessage, StringComparison.Ordinal))
+            {
+                return current;
+            }
+
+            updated = value with { Sequence = ++_sequence };
+            _values[value.SourcePath] = updated;
+        }
         Changed?.Invoke();
+        return updated;
     }
 
-    public void SetGood(
+    public ScpiCachedValue SetGood(
         string sourcePath,
         string endpointId,
         string pointId,
@@ -40,7 +61,7 @@ public sealed class ScpiValueCache
         string operation,
         string? rawResponse)
     {
-        Set(new ScpiCachedValue(
+        return Set(new ScpiCachedValue(
             sourcePath,
             endpointId,
             pointId,
@@ -56,21 +77,23 @@ public sealed class ScpiValueCache
             null));
     }
 
-    public void SetBad(
+    public ScpiCachedValue SetBad(
         string sourcePath,
         string endpointId,
         string pointId,
         string operation,
         string? rawResponse,
         string errorCode,
-        string errorMessage)
+        string errorMessage,
+        bool preserveLastValue = false)
     {
-        Set(new ScpiCachedValue(
+        var previous = preserveLastValue ? Get(sourcePath) : null;
+        return Set(new ScpiCachedValue(
             sourcePath,
             endpointId,
             pointId,
-            null,
-            null,
+            previous?.Value,
+            previous?.RedisValue,
             Contracts.Scpi.ScpiQuality.Bad,
             DateTimeOffset.UtcNow,
             operation,
@@ -101,4 +124,38 @@ public sealed class ScpiValueCache
 
     public IReadOnlyList<ScpiCachedValue> Snapshot() =>
         _values.Values.OrderBy(value => value.SourcePath, StringComparer.OrdinalIgnoreCase).ToList();
+
+    public bool BeginOutage()
+    {
+        lock (_sync)
+        {
+            if (_outageActive) return false;
+            _outageBoundary = _sequence;
+            _outageActive = true;
+            return true;
+        }
+    }
+
+    public (long ObservedSequence, IReadOnlyDictionary<string, ScpiCachedValue> Values) SnapshotForReconciliation()
+    {
+        lock (_sync)
+        {
+            return (
+                _sequence,
+                _values
+                    .Where(item => item.Value.Sequence > _outageBoundary)
+                    .ToDictionary(item => item.Key, item => item.Value, StringComparer.OrdinalIgnoreCase));
+        }
+    }
+
+    public bool TryCompleteReconciliation(long observedSequence)
+    {
+        lock (_sync)
+        {
+            if (_sequence != observedSequence) return false;
+            _outageBoundary = _sequence;
+            _outageActive = false;
+            return true;
+        }
+    }
 }

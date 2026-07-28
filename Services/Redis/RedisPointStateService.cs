@@ -31,10 +31,19 @@ public sealed class RedisPointUpdateException(
 
 public sealed class RedisPointStateService(
     RedisConnectionFactory redis,
-    IRedisPubSubService pubSub,
+    AtomicPointUpdateService atomicPointUpdate,
+    PointUpdateIdentity operationIdentity,
     IOptions<RedisScpiOptions> redisScpiOptions,
     RuntimeModeService runtime)
 {
+    public RedisPointStateService(
+        RedisConnectionFactory redis,
+        IRedisPubSubService pubSub,
+        IOptions<RedisScpiOptions> redisScpiOptions,
+        RuntimeModeService runtime)
+        : this(redis, new AtomicPointUpdateService(redis), new PointUpdateIdentity(redisScpiOptions), redisScpiOptions, runtime)
+    {
+    }
     private static readonly string[] RequiredFields =
     [
         "quality",
@@ -318,29 +327,71 @@ public sealed class RedisPointStateService(
         JsonElement? value,
         string quality,
         string source,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string updateReason = PointUpdateReasons.Acquisition,
+        string? commandId = null,
+        long? timestamp = null,
+        string? operationIdOverride = null)
     {
         ArgumentNullException.ThrowIfNull(mapping);
         ValidateRuntimeArguments(mapping, quality, source);
         var normalizedValue = NormalizeValue(value);
-        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        RedisResult[] result;
-
+        var now = timestamp ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var effectiveUpdateReason = updateReason == PointUpdateReasons.Acquisition && quality == ScpiQuality.Bad
+            ? PointUpdateReasons.AcquisitionFailure
+            : updateReason;
         try
         {
-            var database = await redis.GetDatabaseAsync(cancellationToken);
-            result = (RedisResult[]?)await database.ScriptEvaluateAsync(
-                UpdateDynamicFieldsScript,
-                [mapping.RedisKey],
-                [
-                    normalizedValue.HasValue ? "1" : "0",
-                    normalizedValue.HashValue,
-                    normalizedValue.Kind,
+            var inspection = await InspectAsync(mapping.RedisKey, cancellationToken);
+            if (!inspection.IsComplete || inspection.State is null)
+                throw CreateUpdateException(mapping, "redis_output_failed", "point_state_invalid", $"Redis point key '{mapping.RedisKey}' is incomplete.");
+            var current = inspection.State;
+            var operationId = operationIdOverride
+                ?? (effectiveUpdateReason == PointUpdateReasons.CommandWrite
+                    ? PointOperationId.CommandWrite(
+                        redisScpiOptions.Value.ConverterId,
+                        commandId ?? throw new ArgumentException("commandId is required for command_write.", nameof(commandId)),
+                        mapping.RedisKey)
+                    : operationIdentity.Create(effectiveUpdateReason, mapping.RedisKey, commandId));
+            var request = new AtomicPointUpdateRequest(
+                    mapping.RedisKey,
+                    redisScpiOptions.Value.ConverterId,
+                    current.Version,
+                    operationId,
+                    normalizedValue.HasValue ? normalizedValue.HashValue : null,
+                    normalizedValue.JsonValue,
                     quality,
-                    now.ToString(CultureInfo.InvariantCulture),
+                    now,
                     source,
-                    redisScpiOptions.Value.ConverterId
-                ]) ?? [];
+                    effectiveUpdateReason);
+            AtomicPointUpdateResult result;
+            try
+            {
+                result = await atomicPointUpdate.ApplyAsync(request, cancellationToken);
+            }
+            catch (RedisTimeoutException) when (!cancellationToken.IsCancellationRequested)
+            {
+                result = await atomicPointUpdate.ApplyAsync(request, cancellationToken);
+            }
+            catch (RedisConnectionException) when (!cancellationToken.IsCancellationRequested)
+            {
+                result = await atomicPointUpdate.ApplyAsync(request, cancellationToken);
+            }
+            if (result.Status is not ("applied" or "already_applied") || result.Version is null)
+                throw CreateUpdateException(mapping, "redis_output_failed", result.Status, $"Redis point key '{mapping.RedisKey}' atomic update returned {result.Status}.");
+
+            var updated = current with
+            {
+                Value = normalizedValue.JsonValue,
+                ValueText = normalizedValue.HasValue ? normalizedValue.HashValue : null,
+                HasValueField = normalizedValue.HasValue,
+                Quality = quality,
+                Timestamp = now,
+                Version = result.Version.Value,
+                Source = source
+            };
+            runtime.ClearRedisOutputDiagnostic("redis_writer", mapping.SourcePath, mapping.RedisKey);
+            return updated;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -356,80 +407,6 @@ public sealed class RedisPointStateService(
                 ex);
         }
 
-        var status = result.Length > 0 ? result[0].ToString() ?? "" : "";
-        if (!status.Equals("ok", StringComparison.Ordinal))
-        {
-            throw CreateScriptResultException(mapping, status, result);
-        }
-
-        if (result.Length < 8
-            || !long.TryParse(result[1].ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var version))
-        {
-            throw CreateUpdateException(
-                mapping,
-                "redis_output_failed",
-                "unexpected_result",
-                $"Redis point key '{mapping.RedisKey}' dynamic update returned an unexpected result.");
-        }
-
-        var pointType = result[2].ToString();
-        var access = result[3].ToString();
-        var unit = result[4].ToString();
-        var owner = NullIfEmpty(result[5].ToString());
-        var ownerSource = NullIfEmpty(result[6].ToString());
-        long? ownerAcquiredAt = long.TryParse(
-            result[7].ToString(),
-            NumberStyles.Integer,
-            CultureInfo.InvariantCulture,
-            out var parsedOwnerAcquiredAt)
-            ? parsedOwnerAcquiredAt
-            : null;
-        var updated = new PointStateContract(
-            mapping.RedisKey,
-            normalizedValue.JsonValue,
-            normalizedValue.HasValue ? normalizedValue.HashValue : null,
-            normalizedValue.HasValue,
-            quality,
-            pointType,
-            now,
-            version,
-            source,
-            access,
-            unit,
-            owner,
-            ownerSource,
-            ownerAcquiredAt);
-
-        var valueUpdated = new ValueUpdatedEventContract(
-            Schema: 1,
-            Type: "value.updated",
-            MessageId: Guid.NewGuid().ToString("N"),
-            Key: mapping.RedisKey,
-            Value: normalizedValue.JsonValue,
-            Quality: quality,
-            Version: version,
-            Timestamp: now,
-            Source: source);
-
-        try
-        {
-            await pubSub.PublishAsync(RedisContractNames.ValueUpdatedChannel, valueUpdated, cancellationToken);
-            runtime.ClearRedisOutputDiagnostic("redis_writer", mapping.SourcePath, mapping.RedisKey);
-            return updated;
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            throw CreateUpdateException(
-                mapping,
-                "redis_publish_failed",
-                "redis_publish_failed",
-                $"Redis point '{mapping.RedisKey}' was updated to version {version}, but evt:value-updated publish failed: {ex.Message}",
-                ex);
-        }
     }
 
     private static (bool HasValue, string HashValue, string Kind, JsonElement? JsonValue) NormalizeValue(JsonElement? value)

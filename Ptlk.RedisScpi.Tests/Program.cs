@@ -25,6 +25,8 @@ using StackExchange.Redis;
 
 var tests = new List<(string Name, Func<Task> Run)>
 {
+    ("Point operation UUID v5 golden vectors", RunSync(PointOperationGoldenVectors)),
+    ("SCPI cache outage boundary and endpoint failure scope", RunSync(ScpiCacheOutageBoundaryAndFailureScope)),
     ("SourcePath normalization", RunSync(SourcePathNormalization)),
     ("Template renderer", RunSync(TemplateRenderer)),
     ("Number converter", RunSync(NumberConverter)),
@@ -49,6 +51,8 @@ if (string.Equals(Environment.GetEnvironmentVariable("REDIS_SCPI_INTEGRATION"), 
     tests.Add(("Polling commits under endpoint lock and filters ConverterId", PollingIntegrationAsync));
     tests.Add(("Command idempotency readback mismatch and direct-write integration", CommandFlowIntegrationAsync));
 }
+if (Environment.GetEnvironmentVariable("PTLK_POINT_REDIS_INTEGRATION") == "1")
+    tests.Add(("Atomic point retry stale conflict and large version", AtomicPointUpdateIntegrationAsync));
 
 var passed = 0;
 foreach (var test in tests)
@@ -74,6 +78,149 @@ static Func<Task> RunSync(Action action) => () =>
     action();
     return Task.CompletedTask;
 };
+
+static void PointOperationGoldenVectors()
+{
+    AssertEqual("609b97d27e2751289fb73b8faa381621", PointOperationId.Create("ptlk-point-operation-v1", "acquisition", "instance-01", "42", "point:site/device/temp"));
+    AssertEqual("1905f762767351f699b94fb54f3eaef9", PointOperationId.Create("ptlk-point-operation-v1", "acquisition_failure", "instance-01", "43", "point:site/device/temp"));
+    AssertEqual("b0659d8e251b5245a85a1bbbb63bc8a4", PointOperationId.Create("ptlk-point-operation-v1", "command_write", "redis-data-store", "cmd-0001", "point:site/device/temp"));
+    AssertEqual("37789a49436555588359f9e5f27e3c04", PointOperationId.Create("ptlk-point-operation-v1", "reconnect_sync", "instance-01", "cycle-0001", "44", "point:site/device/temp"));
+    AssertEqual("193cedcc55c351b5a7a5e560ef1e0f9b", PointOperationId.Create("ptlk-point-operation-v1", "supervisor_quality", "edge-instance-01", "1793059200000", "point:site/device/temp", "7"));
+    AssertEqual("fab212a249225c83a79998e715dcafa7", PointOperationId.Create("ptlk-point-operation-v1", "acquisition", "instance-01", "9007199254740993", "point:site/device/temp"));
+}
+
+static async Task AtomicPointUpdateIntegrationAsync()
+{
+    await using var redis = new RedisConnectionFactory(
+        Options.Create(new RedisOptions()),
+        Microsoft.Extensions.Logging.Abstractions.NullLogger<RedisConnectionFactory>.Instance);
+    var connection = await redis.GetConnectionAsync();
+    var db = await redis.GetDatabaseAsync();
+    var key = $"point:codex/phase3/scpi-{Guid.NewGuid():N}";
+    var queue = await connection.GetSubscriber().SubscribeAsync(RedisChannel.Literal("evt:value-updated"));
+    var eventCount = 0;
+    queue.OnMessage(message =>
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(message.Message.ToString());
+            if (document.RootElement.TryGetProperty("key", out var eventKey)
+                && string.Equals(eventKey.GetString(), key, StringComparison.Ordinal))
+            {
+                Interlocked.Increment(ref eventCount);
+            }
+        }
+        catch (JsonException)
+        {
+        }
+    });
+    try
+    {
+        const long initialVersion = 9007199254740993;
+        await db.HashSetAsync(key,
+        [
+            new("quality", "unset"), new("type", "double"), new("timestamp", "0"),
+            new("version", PointOperationId.Number(initialVersion)), new("source", "asset"),
+            new("access", "readwrite"), new("unit", ""), new("owner", "phase3-scpi")
+        ]);
+        var service = new AtomicPointUpdateService(redis);
+        var operation = PointOperationId.Create("ptlk-point-operation-v1", "acquisition", "instance-review", "1", key);
+        var request = new AtomicPointUpdateRequest(
+            key, "phase3-scpi", initialVersion, operation, "12.5",
+            JsonSerializer.SerializeToElement(12.5), "good", 1793059200000, "redis-scpi", "acquisition");
+        AssertEqual("applied", (await service.ApplyAsync(request)).Status);
+        AssertEqual("already_applied", (await service.ApplyAsync(request)).Status);
+        var nextOperation = PointOperationId.Create("ptlk-point-operation-v1", "acquisition", "instance-review", "2", key);
+        AssertEqual("applied", (await service.ApplyAsync(request with
+        {
+            ExpectedVersion = initialVersion + 1,
+            OperationId = nextOperation,
+            Value = "13.5",
+            EventValue = JsonSerializer.SerializeToElement(13.5),
+            Timestamp = 1793059200001
+        })).Status);
+        AssertEqual("stale_conflict", (await service.ApplyAsync(request)).Status);
+        await Task.Delay(100);
+        AssertEqual(2, eventCount);
+        AssertEqual(PointOperationId.Number(initialVersion + 2), (await db.HashGetAsync(key, "version")).ToString());
+        AssertEqual(nextOperation, (await db.HashGetAsync(key, "last_update_operation_id")).ToString());
+
+        const string configuredConverterId = "scpi-contract-review";
+        await db.HashSetAsync(key, "owner", configuredConverterId);
+        var configuredOptions = Options.Create(new RedisScpiOptions
+        {
+            ConverterId = configuredConverterId,
+            SourceName = "redis-scpi-review"
+        });
+        var writer = new RedisPointStateService(
+            redis,
+            service,
+            new PointUpdateIdentity(configuredOptions),
+            configuredOptions,
+            new RuntimeModeService());
+        var command = await writer.UpdateDynamicFieldsAsync(
+            new RedisMapping { SourcePath = "scpi:review/value", RedisKey = key },
+            JsonSerializer.SerializeToElement(14.5),
+            ScpiQuality.Good,
+            "redis-scpi-review",
+            updateReason: PointUpdateReasons.CommandWrite,
+            commandId: "scpi-command-review");
+        await Task.Delay(100);
+        AssertEqual(initialVersion + 3, command.Version);
+        AssertEqual(3, eventCount);
+        AssertEqual(
+            PointOperationId.CommandWrite(configuredConverterId, "scpi-command-review", key),
+            (await db.HashGetAsync(key, "last_update_operation_id")).ToString());
+    }
+    finally
+    {
+        await queue.UnsubscribeAsync();
+        await db.KeyDeleteAsync(key);
+    }
+}
+
+static void ScpiCacheOutageBoundaryAndFailureScope()
+{
+    var cache = new ScpiValueCache();
+    var value = JsonSerializer.SerializeToElement(9.5);
+    var initial = cache.SetGood("scpi:e1/p1", "e1", "p1", value, "9.5", "poll", "9.5");
+    var startup = cache.SnapshotForReconciliation();
+    AssertEqual(1, startup.Values.Count);
+    AssertTrue(cache.TryCompleteReconciliation(startup.ObservedSequence), "Startup reconciliation should complete.");
+    AssertTrue(cache.BeginOutage(), "First outage observation should establish a boundary.");
+    AssertFalse(cache.BeginOutage(), "Repeated outage observations must not move the boundary.");
+
+    var failed = cache.SetBad(
+        "scpi:e1/p1",
+        "e1",
+        "p1",
+        "poll",
+        null,
+        ScpiErrorCodes.TransportError,
+        "connection lost",
+        preserveLastValue: true);
+    AssertEqual("9.5", failed.RedisValue);
+    AssertEqual(ScpiQuality.Bad, failed.Quality);
+    AssertTrue(failed.Sequence > initial.Sequence, "Endpoint failure transition must advance the sequence.");
+    var repeated = cache.SetBad(
+        "scpi:e1/p1",
+        "e1",
+        "p1",
+        "poll",
+        null,
+        ScpiErrorCodes.TransportError,
+        "connection lost",
+        preserveLastValue: true);
+    AssertEqual(failed.Sequence, repeated.Sequence);
+
+    var snapshot = cache.SnapshotForReconciliation();
+    cache.SetBad("scpi:e1/p2", "e1", "p2", "poll", null, ScpiErrorCodes.ResponseInvalid, "invalid number");
+    AssertFalse(cache.TryCompleteReconciliation(snapshot.ObservedSequence),
+        "A racing acquisition result must keep reconciliation pending.");
+    var retry = cache.SnapshotForReconciliation();
+    AssertEqual(2, retry.Values.Count);
+    AssertTrue(cache.TryCompleteReconciliation(retry.ObservedSequence), "Stable retry should complete.");
+}
 
 static void SourcePathNormalization()
 {
@@ -684,7 +831,16 @@ static async Task RedisOwnershipWriterIntegrationAsync()
         var received = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         await realPubSub.SubscribeAsync(
             RedisContractNames.ValueUpdatedChannel,
-            payload => { received.TrySetResult(payload); return Task.CompletedTask; });
+            payload =>
+            {
+                using var candidate = JsonDocument.Parse(payload);
+                if (candidate.RootElement.TryGetProperty("key", out var key)
+                    && key.GetString() == numberKey)
+                {
+                    received.TrySetResult(payload);
+                }
+                return Task.CompletedTask;
+            });
         var mapping = new RedisMapping { SourcePath = "scpi:integration/number", RedisKey = numberKey };
         var updated = await writer.UpdateDynamicFieldsAsync(
             mapping,
@@ -830,6 +986,15 @@ static async Task PollingIntegrationAsync()
     var ownership = new RedisPointOwnershipService(redis, identity, runtime, loggerFactory.CreateLogger<RedisPointOwnershipService>());
     var pointState = new RedisPointStateService(redis, captured, identity, runtime);
     var cache = new ScpiValueCache();
+    var reconciliation = new RedisReconciliationService(
+        database.Factory,
+        cache,
+        ownership,
+        pointState,
+        new PointUpdateIdentity(identity),
+        runtime,
+        identity,
+        loggerFactory.CreateLogger<RedisReconciliationService>());
     var scheduler = new EndpointOperationScheduler();
     var log = new LogService(database.Factory);
     await using var transportFactory = new ScpiTransportFactory(
@@ -850,6 +1015,7 @@ static async Task PollingIntegrationAsync()
         cache,
         new ScpiQualityPolicy(),
         ownership,
+        reconciliation,
         pointState,
         runtime,
         identity,
@@ -857,6 +1023,7 @@ static async Task PollingIntegrationAsync()
 
     try
     {
+        await reconciliation.StartAsync(CancellationToken.None);
         await polling.StartAsync(CancellationToken.None);
         var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
         PointStateContract? state = null;
@@ -885,10 +1052,29 @@ static async Task PollingIntegrationAsync()
             "Polling diagnostics must preserve the point raw response.");
         AssertTrue(failedSample.RawResponse?.Contains("error_queue: -100", StringComparison.Ordinal) == true,
             "Polling diagnostics must preserve the Error Queue raw response.");
+
+        var onlineSample = cache.Get(localSource) ?? throw new InvalidOperationException("Local cache sample missing.");
+        runtime.SetRedisOutput(RuntimeSubsystemStatus.Degraded, false, false, "integration outage");
+        var outageDeadline = DateTimeOffset.UtcNow.AddSeconds(3);
+        while (reconciliation.IsReady && DateTimeOffset.UtcNow < outageDeadline)
+        {
+            await Task.Delay(25);
+        }
+        var versionAtOutage = (await pointState.ReadAsync(localKey))!.Version;
+        while ((cache.Get(localSource)?.Sequence ?? 0) <= onlineSample.Sequence
+               && DateTimeOffset.UtcNow < outageDeadline)
+        {
+            await Task.Delay(25);
+        }
+        AssertTrue((cache.Get(localSource)?.Sequence ?? 0) > onlineSample.Sequence,
+            "SCPI polling must continue updating the local cache while Redis output is unavailable.");
+        await Task.Delay(200);
+        AssertEqual(versionAtOutage, (await pointState.ReadAsync(localKey))!.Version);
     }
     finally
     {
         await polling.StopAsync(CancellationToken.None);
+        await reconciliation.StopAsync(CancellationToken.None);
         polling.Dispose();
         await redisDb.KeyDeleteAsync([localKey, foreignKey, errorKey]);
     }
@@ -1032,6 +1218,15 @@ static async Task CommandFlowIntegrationAsync()
     AssertTrue((await ownership.ClaimAsync("scpi:command-device/voltage", redisKey)).Acquired, "Command point ownership failed.");
     var pointState = new RedisPointStateService(redis, captured, identity, runtime);
     var cache = new ScpiValueCache();
+    var reconciliation = new RedisReconciliationService(
+        database.Factory,
+        cache,
+        ownership,
+        pointState,
+        new PointUpdateIdentity(identity),
+        runtime,
+        identity,
+        loggerFactory.CreateLogger<RedisReconciliationService>());
     var log = new LogService(database.Factory);
     var scheduler = new EndpointOperationScheduler();
     await using var transportFactory = new ScpiTransportFactory(scpiRuntime, loggerFactory);
@@ -1047,6 +1242,7 @@ static async Task CommandFlowIntegrationAsync()
         database.Factory,
         captured,
         ownership,
+        reconciliation,
         pointState,
         client,
         scheduler,
@@ -1065,6 +1261,27 @@ static async Task CommandFlowIntegrationAsync()
 
     try
     {
+        var pendingCommand = DeviceWriteCommandContract.Create(
+            redisKey,
+            0.5d,
+            "integration",
+            "test",
+            commandId: "command-reconciliation-pending",
+            expectedVersion: 0);
+        var beforePendingWrite = Volatile.Read(ref writeCount);
+        var pendingResult = await dispatcher.DispatchRawAsync(
+            JsonSerializer.Serialize(pendingCommand, RedisContractJson.WebOptions));
+        AssertEqual("failed", pendingResult.Status);
+        AssertEqual(beforePendingWrite, Volatile.Read(ref writeCount));
+
+        await reconciliation.StartAsync(CancellationToken.None);
+        var reconciliationDeadline = DateTimeOffset.UtcNow.AddSeconds(3);
+        while (!reconciliation.IsReady && DateTimeOffset.UtcNow < reconciliationDeadline)
+        {
+            await Task.Delay(25);
+        }
+        AssertTrue(reconciliation.IsReady, "Command integration reconciliation did not become ready.");
+
         var invalidSchema = DeviceWriteCommandContract.Create(
             redisKey,
             1d,
@@ -1291,7 +1508,7 @@ static async Task CommandFlowIntegrationAsync()
         await redisDb.HashSetAsync(redisKey, "owner", "other-converter");
         var nonOwner = new RedisPointOwnershipService(redis, identity, runtime, loggerFactory.CreateLogger<RedisPointOwnershipService>());
         var ignoredExecution = new CommandExecutionService(
-            database.Factory, captured, nonOwner, pointState, client, scheduler, cache, log, runtime,
+            database.Factory, captured, nonOwner, reconciliation, pointState, client, scheduler, cache, log, runtime,
             identity, redisRuntime, loggerFactory.CreateLogger<CommandExecutionService>());
         var ignored = DeviceWriteCommandContract.Create(
             redisKey, 3d, "integration", "test", commandId: "command-non-owner", expectedVersion: 4);
@@ -1308,6 +1525,7 @@ static async Task CommandFlowIntegrationAsync()
     }
     finally
     {
+        await reconciliation.StopAsync(CancellationToken.None);
         await redisDb.KeyDeleteAsync([redisKey, foreignConverterKey]);
     }
 }

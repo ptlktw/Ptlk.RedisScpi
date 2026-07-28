@@ -11,4 +11,5 @@ public sealed record ValueUpdatedEventContract(
     string Quality,
     long Version,
     long Timestamp,
-    string Source);
+    string Source,
+    string? UpdateReason = null);
