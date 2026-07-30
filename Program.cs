@@ -7,11 +7,13 @@ using Ptlk.RedisScpi.Services.Browser;
 using Ptlk.RedisScpi.Services.Commands;
 using Ptlk.RedisScpi.Services.ImportExport;
 using Ptlk.RedisScpi.Services.Logs;
+using Ptlk.RedisScpi.Services.Ownership;
 using Ptlk.RedisScpi.Services.Paths;
 using Ptlk.RedisScpi.Services.Redis;
 using Ptlk.RedisScpi.Services.Scpi;
 using Ptlk.RedisScpi.Services.Startup;
 using Ptlk.RedisScpi.Services.Ui;
+using Ptlk.SCADA.Interop.Runtime;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -35,6 +37,12 @@ builder.Services.AddDbContextFactory<AppDbContext>(options =>
         .UseSnakeCaseNamingConvention());
 
 builder.Services.AddSingleton<RuntimeModeService>();
+builder.Services.AddSingleton<EdgeRuntimeIdentity>();
+builder.Services.AddSingleton<PointRuntimeLifecycleGate>();
+builder.Services.AddSingleton<PointOwnershipReleaseSignal>();
+builder.Services.AddSingleton<PointOwnershipReleaseRuntimeState>();
+builder.Services.AddSingleton<Ptlk.SCADA.Interop.Redis.PointOwnershipReleaseScript>();
+builder.Services.AddSingleton<Ptlk.SCADA.Interop.Redis.PointOwnershipReleaseExecutor>();
 builder.Services.AddSingleton<RedisConnectionFactory>();
 builder.Services.AddSingleton<RedisPubSubService>();
 builder.Services.AddSingleton<IRedisPubSubService>(provider => provider.GetRequiredService<RedisPubSubService>());
@@ -51,6 +59,7 @@ builder.Services.AddSingleton<RedisPointStateService>(provider => new RedisPoint
     provider.GetRequiredService<RuntimeModeService>()));
 builder.Services.AddSingleton<RedisReconciliationService>();
 builder.Services.AddSingleton<RedisKeySuggestionService>();
+builder.Services.AddSingleton<PointOwnershipReleaseCoordinator>();
 
 builder.Services.AddSingleton<ScpiSourcePathService>();
 builder.Services.AddSingleton<ScpiTemplateRenderer>();
@@ -75,11 +84,13 @@ builder.Services.AddScoped<CommandDispatcherService>();
 builder.Services.AddScoped<CsvConfigService>();
 builder.Services.AddScoped<ZipConfigService>();
 builder.Services.AddScoped<ScreenAlertService>();
+builder.Services.AddScoped<PointOwnershipReleaseIntentService>();
 
 builder.Services.AddHostedService<StartupGateService>();
+builder.Services.AddHostedService<RedisScpiStatusService>();
+builder.Services.AddHostedService(provider => provider.GetRequiredService<PointOwnershipReleaseCoordinator>());
 builder.Services.AddHostedService<RedisPointOwnershipHostedService>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<RedisReconciliationService>());
-builder.Services.AddHostedService<RedisScpiStatusService>();
 builder.Services.AddHostedService<ScpiPollingHostedService>();
 builder.Services.AddHostedService<DeviceCommandSubscriptionService>();
 builder.Services.AddHostedService<CommandExecutionCleanupHostedService>();

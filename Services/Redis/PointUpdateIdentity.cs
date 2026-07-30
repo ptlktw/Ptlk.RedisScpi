@@ -1,13 +1,19 @@
 using Microsoft.Extensions.Options;
 using Ptlk.RedisScpi.Configuration;
+using Ptlk.SCADA.Interop.Runtime;
 
 namespace Ptlk.RedisScpi.Services.Redis;
 
-public sealed class PointUpdateIdentity(IOptions<RedisScpiOptions> options)
+public sealed class PointUpdateIdentity(IOptions<RedisScpiOptions> options, EdgeRuntimeIdentity runtimeIdentity)
 {
     private long sequence;
 
-    public string InstanceId { get; } = Guid.NewGuid().ToString("N");
+    public PointUpdateIdentity(IOptions<RedisScpiOptions> options)
+        : this(options, new EdgeRuntimeIdentity())
+    {
+    }
+
+    public string InstanceId => runtimeIdentity.InstanceId;
 
     public string Create(string reason, string key, string? commandId = null)
     {

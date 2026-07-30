@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using Ptlk.RedisScpi.Contracts.Scpi;
 using Ptlk.RedisScpi.Data;
 using Ptlk.RedisScpi.Models;
+using Ptlk.RedisScpi.Services.Ownership;
 using Ptlk.RedisScpi.Services.Paths;
 
 namespace Ptlk.RedisScpi.Services.Scpi;
@@ -9,7 +10,8 @@ namespace Ptlk.RedisScpi.Services.Scpi;
 public sealed class ScpiPointService(
     IDbContextFactory<AppDbContext> dbFactory,
     ScpiSourcePathService paths,
-    ScpiTemplateRenderer templates)
+    ScpiTemplateRenderer templates,
+    PointOwnershipReleaseIntentService? releases = null)
 {
     public async Task<List<ScpiPointConfig>> ListAsync(CancellationToken cancellationToken = default)
     {
@@ -178,6 +180,35 @@ public sealed class ScpiPointService(
         db.Entry(point).Property(item => item.ConcurrencyStamp).OriginalValue = expectedConcurrencyStamp;
         var mapping = await db.RedisMappings
             .FirstOrDefaultAsync(item => item.SourcePath == point.SourcePath, cancellationToken);
+        if (releases is not null)
+        {
+            try
+            {
+                await releases.RequestSourceDeleteAsync(
+                    mapping is null ? [] : [mapping.Id],
+                    async (sourceDb, token) =>
+                    {
+                        var current = await sourceDb.ScpiPointConfigs
+                            .Include(item => item.EndpointConfig)
+                            .FirstOrDefaultAsync(item => item.Id == id, token)
+                            ?? throw new ScpiConfigurationConcurrencyException(
+                                "The point changed after it was opened. Reload before deleting it.");
+                        EnsureCurrent(expectedConcurrencyStamp, current.ConcurrencyStamp, $"point '{current.SourcePath}'");
+                        sourceDb.Entry(current).Property(item => item.ConcurrencyStamp).OriginalValue = expectedConcurrencyStamp;
+                        if (current.EndpointConfig is not null)
+                            TouchEndpoint(current.EndpointConfig);
+                        sourceDb.ScpiPointConfigs.Remove(current);
+                    },
+                    cancellationToken);
+                return;
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                throw new ScpiConfigurationConcurrencyException(
+                    "The point or its mapping changed after it was opened. Reload before deleting it.");
+            }
+        }
+
         if (mapping is not null)
         {
             db.RedisMappings.Remove(mapping);

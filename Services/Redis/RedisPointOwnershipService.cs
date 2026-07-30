@@ -4,6 +4,7 @@ using Microsoft.Extensions.Options;
 using Ptlk.RedisScpi.Configuration;
 using Ptlk.RedisScpi.Services.Startup;
 using Ptlk.SCADA.Interop.PointValues;
+using Ptlk.SCADA.Interop.Runtime;
 using StackExchange.Redis;
 
 namespace Ptlk.RedisScpi.Services.Redis;
@@ -21,7 +22,8 @@ public sealed class RedisPointOwnershipService(
     IOptions<RedisScpiOptions> options,
     RuntimeModeService runtime,
     ILogger<RedisPointOwnershipService> logger,
-    RedisMappingActivationService? activation = null)
+    RedisMappingActivationService? activation = null,
+    PointRuntimeLifecycleGate? lifecycleGate = null)
 {
     private static readonly TimeSpan ClaimRefreshInterval = TimeSpan.FromSeconds(5);
 
@@ -65,7 +67,9 @@ public sealed class RedisPointOwnershipService(
         {
             return false;
         }
-        return _claims.TryGetValue(sourcePath, out var claim) && claim.Acquired;
+        return _claims.TryGetValue(sourcePath, out var claim)
+            && claim.Acquired
+            && lifecycleGate?.IsReleasing(claim.RedisKey) != true;
     }
 
     public async Task<bool> EnsureOwnedAsync(
@@ -73,6 +77,9 @@ public sealed class RedisPointOwnershipService(
         string redisKey,
         CancellationToken cancellationToken = default)
     {
+        if (lifecycleGate?.IsReleasing(redisKey) == true)
+            return false;
+
         if (!RequiresOwnership(sourcePath))
         {
             return false;
@@ -111,6 +118,13 @@ public sealed class RedisPointOwnershipService(
             .OrderBy(claim => claim.SourcePath, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
+    public async Task<string?> ReadOwnerAsync(string redisKey, CancellationToken cancellationToken = default)
+    {
+        var database = await redis.GetDatabaseAsync(cancellationToken);
+        var owner = await database.HashGetAsync(redisKey, "owner");
+        return owner.HasValue ? owner.ToString() : null;
+    }
+
     public async Task<PointOwnershipClaimResult> ClaimAsync(
         string sourcePath,
         string redisKey,
@@ -118,6 +132,20 @@ public sealed class RedisPointOwnershipService(
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sourcePath);
         ArgumentException.ThrowIfNullOrWhiteSpace(redisKey);
+        var pointLease = lifecycleGate is null
+            ? null
+            : await lifecycleGate.TryAcquireRuntimeAsync(redisKey, cancellationToken);
+        await using var pointLeaseCleanup = pointLease;
+        if (lifecycleGate is not null && pointLease is null)
+        {
+            return Store(new PointOwnershipClaimResult(
+                sourcePath,
+                redisKey,
+                false,
+                "ownership_releasing",
+                options.Value.ConverterId,
+                DateTimeOffset.UtcNow));
+        }
         if (!RequiresOwnership(sourcePath))
         {
             return Store(new PointOwnershipClaimResult(

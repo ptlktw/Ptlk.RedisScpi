@@ -7,6 +7,8 @@ using Ptlk.RedisScpi.Configuration;
 using Ptlk.RedisScpi.Contracts.Scpi;
 using Ptlk.RedisScpi.Data;
 using Ptlk.RedisScpi.Models;
+using Ptlk.RedisScpi.Services.Ownership;
+using Ptlk.SCADA.Interop.Runtime;
 
 namespace Ptlk.RedisScpi.Services.ImportExport;
 
@@ -17,7 +19,8 @@ public sealed record CsvImportResult(int ImportedRows, IReadOnlyList<string> Err
 
 public sealed class CsvConfigService(
     IDbContextFactory<AppDbContext> dbFactory,
-    IOptions<ImportExportOptions> options)
+    IOptions<ImportExportOptions> options,
+    PointOwnershipReleaseIntentService? releases = null)
 {
     public async Task<Stream> ExportAsync(CancellationToken cancellationToken = default)
     {
@@ -150,6 +153,7 @@ public sealed class CsvConfigService(
         await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
         var errors = new List<string>();
+        PointOwnershipReleasePreparation? remapPreparation = null;
         try
         {
             await ApplyEndpointsAsync(db, parsed.Endpoints, errors, cancellationToken);
@@ -170,13 +174,14 @@ public sealed class CsvConfigService(
                 return await RollbackAsync(db, transaction, errors, cancellationToken);
             }
 
-            await ApplyMappingsAsync(db, parsed.Points, parsed.Mappings, errors, cancellationToken);
+            remapPreparation = await ApplyMappingsAsync(db, parsed.Points, parsed.Mappings, errors, cancellationToken);
             if (errors.Count > 0)
             {
                 return await RollbackAsync(db, transaction, errors, cancellationToken);
             }
 
             await transaction.CommitAsync(cancellationToken);
+            remapPreparation?.MarkCommitted();
             return new CsvImportResult(parsed.RowCount, []);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -188,6 +193,11 @@ public sealed class CsvConfigService(
         {
             errors.Add($"Import failed: {InnermostMessage(ex)}");
             return await RollbackAsync(db, transaction, errors, cancellationToken);
+        }
+        finally
+        {
+            if (remapPreparation is not null)
+                await remapPreparation.DisposeAsync();
         }
     }
 
@@ -413,7 +423,7 @@ public sealed class CsvConfigService(
         }
     }
 
-    private async Task ApplyMappingsAsync(
+    private async Task<PointOwnershipReleasePreparation?> ApplyMappingsAsync(
         AppDbContext db,
         IReadOnlyList<PointImportRow> pointRows,
         IReadOnlyList<MappingImportRow> mappingRows,
@@ -473,7 +483,7 @@ public sealed class CsvConfigService(
 
         if (errors.Count > 0)
         {
-            return;
+            return null;
         }
 
         var changedMappings = new List<(RedisMapping Mapping, string RedisKey)>();
@@ -498,7 +508,18 @@ public sealed class CsvConfigService(
             mappingsBySource.Add(sourcePath, newMapping);
         }
 
-        if (changedMappings.Count > 0)
+        PointOwnershipReleasePreparation? preparation = null;
+        if (changedMappings.Count > 0 && releases is not null)
+        {
+            var requests = changedMappings.Select(item => new PointOwnershipRemapPreparationRequest(
+                item.Mapping.Id,
+                item.Mapping.SourcePath,
+                item.Mapping.RedisKey,
+                item.Mapping.SourcePath,
+                item.RedisKey)).ToArray();
+            preparation = await releases.PrepareRemapsAsync(db, requests, cancellationToken);
+        }
+        else if (changedMappings.Count > 0)
         {
             var occupiedKeys = mappings.Select(mapping => mapping.RedisKey)
                 .Concat(desiredKeys.Values)
@@ -524,8 +545,18 @@ public sealed class CsvConfigService(
             }
         }
 
-        db.RedisMappings.AddRange(newMappings);
-        await db.SaveChangesAsync(cancellationToken);
+        try
+        {
+            db.RedisMappings.AddRange(newMappings);
+            await db.SaveChangesAsync(cancellationToken);
+            return preparation;
+        }
+        catch
+        {
+            if (preparation is not null)
+                await preparation.DisposeAsync();
+            throw;
+        }
     }
 
     private async Task<CsvImportResult> RollbackAsync(

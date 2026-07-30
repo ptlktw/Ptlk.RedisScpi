@@ -8,6 +8,7 @@ using Ptlk.RedisScpi.Models;
 using Ptlk.RedisScpi.Services.Startup;
 using Ptlk.SCADA.Interop.PointValues;
 using Ptlk.SCADA.Interop.Redis;
+using Ptlk.SCADA.Interop.Runtime;
 using StackExchange.Redis;
 using InteropRedisHashParseStatus = Ptlk.SCADA.Interop.Contracts.Redis.RedisHashParseStatus;
 
@@ -44,7 +45,7 @@ public sealed class RedisPointStateService(
         IRedisPubSubService pubSub,
         IOptions<RedisScpiOptions> redisScpiOptions,
         RuntimeModeService runtime)
-        : this(redis, new AtomicPointUpdateService(redis), new PointUpdateIdentity(redisScpiOptions), redisScpiOptions, runtime)
+        : this(redis, new AtomicPointUpdateService(redis), new PointUpdateIdentity(redisScpiOptions, new EdgeRuntimeIdentity()), redisScpiOptions, runtime)
     {
     }
     private static readonly string[] RequiredFields =

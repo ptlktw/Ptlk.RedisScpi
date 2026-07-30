@@ -17,11 +17,13 @@ using Ptlk.RedisScpi.Services.Browser;
 using Ptlk.RedisScpi.Services.Commands;
 using Ptlk.RedisScpi.Services.ImportExport;
 using Ptlk.RedisScpi.Services.Logs;
+using Ptlk.RedisScpi.Services.Ownership;
 using Ptlk.RedisScpi.Services.Paths;
 using Ptlk.RedisScpi.Services.Redis;
 using Ptlk.RedisScpi.Services.Scpi;
 using Ptlk.RedisScpi.Services.Startup;
 using Ptlk.SCADA.Interop.PointValues;
+using Ptlk.SCADA.Interop.Runtime;
 using StackExchange.Redis;
 using CommandResultEventContract = Ptlk.SCADA.Interop.Contracts.Redis.CommandResultEventContract;
 
@@ -45,7 +47,8 @@ var tests = new List<(string Name, Func<Task> Run)>
     ("Runtime state exposes subsystem diagnostics", RunSync(RuntimeStateDiagnostics)),
     ("Command retention preserves accepted rows", CommandRetentionAsync),
     ("Canonical JSON ignores object property order", RunSync(CanonicalJsonNormalization)),
-    ("Mapping activation distinguishes number and enum ranges", RunSync(MappingActivationDistinguishesNumberAndEnumRanges))
+    ("Mapping activation distinguishes number and enum ranges", RunSync(MappingActivationDistinguishesNumberAndEnumRanges)),
+    ("RDI-18 remap journal retires the old active mapping", OwnershipReleaseJournalAsync)
 };
 
 if (string.Equals(Environment.GetEnvironmentVariable("REDIS_SCPI_INTEGRATION"), "1", StringComparison.Ordinal))
@@ -105,6 +108,34 @@ static void MappingActivationDistinguishesNumberAndEnumRanges()
         "int")!;
     AssertEqual(PointMappingActivationStatus.Inactive, incompatible.Status);
     AssertEqual(PointValueDiagnosticCodes.MappingTypeIncompatible, incompatible.DiagnosticCode);
+}
+
+static async Task OwnershipReleaseJournalAsync()
+{
+    await using var database = await TestDatabase.CreateAsync();
+    int mappingId;
+    await using (var db = await database.Factory.CreateDbContextAsync())
+    {
+        var mapping = new RedisMapping { SourcePath = "scpi:scope/voltage", RedisKey = "point:rdi18/scpi/old" };
+        db.RedisMappings.Add(mapping);
+        await db.SaveChangesAsync();
+        mappingId = mapping.Id;
+    }
+    var gate = new PointRuntimeLifecycleGate();
+    var service = new PointOwnershipReleaseIntentService(
+        database.Factory,
+        gate,
+        new PointOwnershipReleaseSignal(),
+        Options.Create(new RedisScpiOptions { ConverterId = "rdi18-scpi" }));
+    var intent = await service.RequestRemapAsync(
+        mappingId,
+        "scpi:scope/voltage",
+        "point:rdi18/scpi/new");
+    AssertTrue(intent is not null, "remap must create an intent");
+    AssertEqual(PointOwnershipReleaseStatuses.PendingRelease, intent!.Status);
+    AssertTrue(gate.IsReleasing("point:rdi18/scpi/old"), "old key must be gated");
+    await using var verify = await database.Factory.CreateDbContextAsync();
+    AssertTrue(!await verify.RedisMappings.AnyAsync(item => item.Id == mappingId), "old mapping must be inactive");
 }
 
 static void PointOperationGoldenVectors()

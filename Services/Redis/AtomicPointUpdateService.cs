@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using Ptlk.SCADA.Interop.PointValues;
+using Ptlk.SCADA.Interop.Runtime;
 using StackExchange.Redis;
 using ValueUpdatedEventContract = Ptlk.SCADA.Interop.Contracts.Redis.ValueUpdatedEventContract;
 
@@ -11,12 +12,12 @@ namespace Ptlk.RedisScpi.Services.Redis;
 
 public static class PointUpdateReasons
 {
-    public const string Acquisition = "acquisition";
-    public const string AcquisitionFailure = "acquisition_failure";
-    public const string CommandWrite = "command_write";
-    public const string ReconnectSync = "reconnect_sync";
-    public const string SupervisorQuality = "supervisor_quality";
-    public static bool IsKnown(string value) => value is Acquisition or AcquisitionFailure or CommandWrite or ReconnectSync or SupervisorQuality;
+    public const string Acquisition = Ptlk.SCADA.Interop.Contracts.Redis.PointUpdateReasonNames.Acquisition;
+    public const string AcquisitionFailure = Ptlk.SCADA.Interop.Contracts.Redis.PointUpdateReasonNames.AcquisitionFailure;
+    public const string CommandWrite = Ptlk.SCADA.Interop.Contracts.Redis.PointUpdateReasonNames.CommandWrite;
+    public const string ReconnectSync = Ptlk.SCADA.Interop.Contracts.Redis.PointUpdateReasonNames.ReconnectSync;
+    public const string SupervisorQuality = Ptlk.SCADA.Interop.Contracts.Redis.PointUpdateReasonNames.SupervisorQuality;
+    public static bool IsKnown(string value) => Ptlk.SCADA.Interop.Contracts.Redis.PointUpdateReasonNames.IsKnown(value);
 }
 
 public static class PointOperationId
@@ -95,11 +96,18 @@ public static class AtomicPointUpdateLua
         """;
 }
 
-public sealed class AtomicPointUpdateService(RedisConnectionFactory redis)
+public sealed class AtomicPointUpdateService(RedisConnectionFactory redis, PointRuntimeLifecycleGate? lifecycleGate = null)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     public async Task<AtomicPointUpdateResult> ApplyAsync(AtomicPointUpdateRequest request, CancellationToken cancellationToken = default)
     {
+        var pointLease = lifecycleGate is null
+            ? null
+            : await lifecycleGate.TryAcquireRuntimeAsync(request.Key, cancellationToken);
+        await using var pointLeaseCleanup = pointLease;
+        if (lifecycleGate is not null && pointLease is null)
+            return new AtomicPointUpdateResult("ownership_releasing");
+
         var canonical = Validate(request);
         var nextVersion = checked(request.ExpectedVersion + 1);
         var payload = JsonSerializer.Serialize(new ValueUpdatedEventContract(1, "value.updated", request.OperationId, request.Key, canonical.PointType, canonical.JsonValue, request.Quality, nextVersion, request.Timestamp, request.Source, request.UpdateReason), JsonOptions);

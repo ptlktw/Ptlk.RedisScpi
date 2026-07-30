@@ -167,6 +167,8 @@ else
     </div>
 }
 
+<OwnershipReleasePanel />
+
 @code {
     private readonly CancellationTokenSource disposal = new();
     private List<Ptlk.RedisScpi.Models.RedisMapping> items = [];
@@ -322,7 +324,7 @@ else
             await Mappings.DeleteAsync(deleting.Id, deleting.ConcurrencyStamp, disposal.Token);
             deleting = null;
             await LoadAsync();
-            await Alerts.ShowAsync("RedisMapping deleted.", ScreenAlertSeverity.Success, "Mapping deleted");
+            await Alerts.ShowAsync("Ownership release requested. Track the operation below.", ScreenAlertSeverity.Success, "Release requested");
         }
         catch (OperationCanceledException) when (disposal.IsCancellationRequested)
         {

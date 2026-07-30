@@ -12,6 +12,7 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
     public DbSet<CommandExecution> CommandExecutions => Set<CommandExecution>();
     public DbSet<ScpiLogEntry> ScpiLogEntries => Set<ScpiLogEntry>();
     public DbSet<SystemLogEntry> SystemLogEntries => Set<SystemLogEntry>();
+    public DbSet<PointOwnershipReleaseIntent> PointOwnershipReleaseIntents => Set<PointOwnershipReleaseIntent>();
 
     public override int SaveChanges()
     {
@@ -137,6 +138,28 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
             entity.Property(log => log.Message).HasMaxLength(2000).IsRequired();
             entity.Property(log => log.CommandId).HasMaxLength(160);
         });
+
+        ConfigurePointOwnershipReleaseIntent(modelBuilder.Entity<PointOwnershipReleaseIntent>());
+    }
+
+    private static void ConfigurePointOwnershipReleaseIntent(Microsoft.EntityFrameworkCore.Metadata.Builders.EntityTypeBuilder<PointOwnershipReleaseIntent> entity)
+    {
+        entity.HasIndex(x => x.OperationId).IsUnique();
+        entity.HasIndex(x => new { x.Status, x.NextAttemptAt, x.RequestedAt });
+        entity.HasIndex(x => x.RedisKey).IsUnique().HasFilter("\"status\" <> 'applied'");
+        entity.HasIndex(x => x.ReplacementRedisKey).IsUnique().HasFilter("\"replacement_redis_key\" IS NOT NULL AND \"status\" <> 'applied'");
+        entity.HasIndex(x => new { x.SourcePath, x.Status });
+        entity.Property(x => x.OperationId).HasMaxLength(32).IsRequired();
+        entity.Property(x => x.ConverterId).HasMaxLength(160).IsRequired();
+        entity.Property(x => x.SourcePath).HasMaxLength(320);
+        entity.Property(x => x.RedisKey).HasMaxLength(320).IsRequired();
+        entity.Property(x => x.Reason).HasMaxLength(40).IsRequired();
+        entity.Property(x => x.CompletionAction).HasMaxLength(32).IsRequired();
+        entity.Property(x => x.ReplacementSourcePath).HasMaxLength(320);
+        entity.Property(x => x.ReplacementRedisKey).HasMaxLength(320);
+        entity.Property(x => x.Status).HasMaxLength(32).IsRequired();
+        entity.Property(x => x.LastResultCode).HasMaxLength(80);
+        entity.Property(x => x.LastErrorMessage).HasMaxLength(1000);
     }
 
     private void TouchAuditFields()

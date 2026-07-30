@@ -4,6 +4,7 @@ using Ptlk.RedisScpi.Configuration;
 using Ptlk.RedisScpi.Contracts.Scpi;
 using Ptlk.RedisScpi.Data;
 using Ptlk.RedisScpi.Models;
+using Ptlk.RedisScpi.Services.Ownership;
 using Ptlk.RedisScpi.Services.Paths;
 
 namespace Ptlk.RedisScpi.Services.Scpi;
@@ -13,7 +14,8 @@ public sealed class ScpiConfigurationConcurrencyException(string message) : Inva
 public sealed class ScpiEndpointService(
     IDbContextFactory<AppDbContext> dbFactory,
     ScpiSourcePathService paths,
-    IOptions<RedisScpiOptions> redisScpiOptions)
+    IOptions<RedisScpiOptions> redisScpiOptions,
+    PointOwnershipReleaseIntentService? releases = null)
 {
     public const string TcpTransport = "tcp";
 
@@ -126,7 +128,50 @@ public sealed class ScpiEndpointService(
             var mappings = await db.RedisMappings
                 .Where(mapping => sourcePaths.Contains(mapping.SourcePath))
                 .ToListAsync(cancellationToken);
+            if (releases is not null)
+            {
+                try
+                {
+                    await releases.RequestSourceDeleteAsync(
+                        mappings.Select(mapping => mapping.Id).ToArray(),
+                        async (sourceDb, token) =>
+                        {
+                            var current = await sourceDb.ScpiEndpointConfigs
+                                .Include(item => item.Points)
+                                .FirstOrDefaultAsync(item => item.Id == id, token)
+                                ?? throw new ScpiConfigurationConcurrencyException(
+                                    "The endpoint changed after it was opened. Reload before deleting it.");
+                            EnsureCurrent(expectedConcurrencyStamp, current.ConcurrencyStamp, $"endpoint '{current.EndpointId}'");
+                            sourceDb.Entry(current).Property(item => item.ConcurrencyStamp).OriginalValue = expectedConcurrencyStamp;
+                            sourceDb.ScpiEndpointConfigs.Remove(current);
+                        },
+                        cancellationToken);
+                    return;
+                }
+                catch (DbUpdateConcurrencyException)
+                {
+                    throw new ScpiConfigurationConcurrencyException(
+                        "The endpoint or one of its mappings changed after it was opened. Reload before deleting it.");
+                }
+            }
             db.RedisMappings.RemoveRange(mappings);
+        }
+        else if (releases is not null)
+        {
+            await releases.RequestSourceDeleteAsync(
+                [],
+                async (sourceDb, token) =>
+                {
+                    var current = await sourceDb.ScpiEndpointConfigs
+                        .FirstOrDefaultAsync(item => item.Id == id, token)
+                        ?? throw new ScpiConfigurationConcurrencyException(
+                            "The endpoint changed after it was opened. Reload before deleting it.");
+                    EnsureCurrent(expectedConcurrencyStamp, current.ConcurrencyStamp, $"endpoint '{current.EndpointId}'");
+                    sourceDb.Entry(current).Property(item => item.ConcurrencyStamp).OriginalValue = expectedConcurrencyStamp;
+                    sourceDb.ScpiEndpointConfigs.Remove(current);
+                },
+                cancellationToken);
+            return;
         }
 
         db.ScpiEndpointConfigs.Remove(endpoint);

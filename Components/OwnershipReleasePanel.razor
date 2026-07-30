@@ -1,0 +1,30 @@
+@using Ptlk.RedisScpi.Services.Ownership
+@inject PointOwnershipReleaseIntentService Releases
+@inject RedisPointOwnershipService Ownership
+@inject IJSRuntime JS
+
+<section class="surface" style="margin-top:1rem">
+    <div class="page-header"><div><h2>Ownership releases</h2><p class="page-kicker">Durable point retirement and remap lifecycle.</p></div><button class="btn btn-outline-primary btn-sm" type="button" @onclick="LoadAsync" disabled="@loading">Refresh</button></div>
+    <div class="status-grid"><div>Pending <strong>@PendingCount</strong></div><div>Applied <strong>@items.Count(item => item.Status == PointOwnershipReleaseStatuses.Applied)</strong></div><div>Needs attention <strong>@items.Count(item => item.Status == PointOwnershipReleaseStatuses.NeedsAttention)</strong></div><div>Oldest pending <strong>@FormatTime(OldestPendingAt)</strong></div></div>
+    @if (!string.IsNullOrWhiteSpace(error)) { <div class="error-state">@error</div> }
+    else if (items.Count == 0) { <div class="empty-state">No ownership release history.</div> }
+    else {
+        <div class="table-responsive"><table class="table table-sm align-middle"><thead><tr><th>Redis key / source</th><th>Reason / replacement</th><th>Status</th><th>Attempts</th><th>Last result</th><th>Requested / updated</th><th></th></tr></thead><tbody>
+        @foreach (var item in items) {
+            <tr><td><code>@item.RedisKey</code><br /><small>@item.SourcePath</small></td><td>@item.Reason@if (!string.IsNullOrWhiteSpace(item.ReplacementRedisKey)) { <div><code>@item.RedisKey</code> → <code>@item.ReplacementRedisKey</code><br /><small>New key is inactive until release is applied.</small></div> }</td><td>@DisplayStatus(item.Status)</td><td>@item.AttemptCount</td><td>@item.LastResultCode@if (!string.IsNullOrWhiteSpace(item.LastErrorMessage)) { <div><small>@item.LastErrorMessage</small></div> }</td><td>@FormatTime(item.RequestedAt)<br /><small>@FormatTime(item.UpdatedAt)</small></td><td>@if (item.Status == PointOwnershipReleaseStatuses.NeedsAttention) { <button class="btn btn-warning btn-sm" type="button" @onclick="() => RetryAsync(item)">Retry</button> }</td></tr>
+        }</tbody></table></div>
+    }
+</section>
+
+@code {
+    private List<PointOwnershipReleaseIntent> items = [];
+    private bool loading;
+    private string? error;
+    private int PendingCount => items.Count(item => item.Status is PointOwnershipReleaseStatuses.PendingRelease or PointOwnershipReleaseStatuses.RedisReleased);
+    private long? OldestPendingAt => items.Where(item => item.Status is PointOwnershipReleaseStatuses.PendingRelease or PointOwnershipReleaseStatuses.RedisReleased).Select(item => (long?)item.RequestedAt).Min();
+    protected override Task OnInitializedAsync() => LoadAsync();
+    private async Task LoadAsync() { loading = true; error = null; try { items = await Releases.ListAsync(); } catch (Exception ex) { error = ex.Message; } finally { loading = false; } }
+    private async Task RetryAsync(PointOwnershipReleaseIntent item) { string? owner; try { owner = await Ownership.ReadOwnerAsync(item.RedisKey); } catch (Exception ex) { error = $"Unable to read current owner: {ex.Message}"; return; } var confirmed = await JS.InvokeAsync<bool>("confirm", $"Retry ownership release for {item.RedisKey}? Current owner: {owner ?? "(none)"}. Last error: {item.LastErrorMessage ?? item.LastResultCode ?? "(none)"}"); if (!confirmed) return; await Releases.RetryAsync(item.Id); await LoadAsync(); }
+    private static string DisplayStatus(string status) => status == PointOwnershipReleaseStatuses.RedisReleased ? "Pending (local finalization)" : status;
+    private static string FormatTime(long? value) => value.HasValue ? DateTimeOffset.FromUnixTimeMilliseconds(value.Value).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") : "—";
+}

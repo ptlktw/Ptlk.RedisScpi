@@ -11,6 +11,8 @@ using Ptlk.RedisScpi.Services.Redis;
 using Ptlk.RedisScpi.Services.Scpi;
 using Ptlk.RedisScpi.Services.Startup;
 using Ptlk.SCADA.Interop.PointValues;
+using CommandFailureReasonNames = Ptlk.SCADA.Interop.Contracts.Redis.CommandFailureReasonNames;
+using Ptlk.SCADA.Interop.Runtime;
 using CommandResultEventContract = Ptlk.SCADA.Interop.Contracts.Redis.CommandResultEventContract;
 
 namespace Ptlk.RedisScpi.Services.Commands;
@@ -28,7 +30,8 @@ public sealed class CommandExecutionService(
     RuntimeModeService runtime,
     IOptions<RedisScpiOptions> redisScpiOptions,
     IOptions<RedisScpiRuntimeOptions> runtimeOptions,
-    ILogger<CommandExecutionService> logger)
+    ILogger<CommandExecutionService> logger,
+    PointRuntimeLifecycleGate? lifecycleGate = null)
 {
     public async Task<CommandDispatchResult> AcceptAsync(
         DeviceWriteCommandContract command,
@@ -45,6 +48,23 @@ public sealed class CommandExecutionService(
         var target = await ResolveTargetAsync(command.Key, cancellationToken);
         if (target?.Mapping is null)
         {
+            var release = await FindNonterminalReleaseAsync(command.Key, cancellationToken);
+            if (release)
+            {
+                var state = await pointState.ReadAsync(command.Key, cancellationToken);
+                if (string.Equals(state?.Owner, redisScpiOptions.Value.ConverterId, StringComparison.Ordinal))
+                {
+                    var pendingClaim = await ClaimAsync(command, canonicalPayload, cancellationToken);
+                    if (!pendingClaim.Winner)
+                        return await HandleDuplicateAsync(command, canonicalPayload, pendingClaim.Execution, cancellationToken);
+                    return await FinishFailedAsync(
+                        command,
+                        CommandFailureReasonNames.OwnershipReleasing,
+                        "Point ownership release is in progress.",
+                        cancellationToken);
+                }
+            }
+
             runtime.ReportRuntimeDiagnostic(
                 "command_route",
                 command.CommandId,
@@ -188,6 +208,17 @@ public sealed class CommandExecutionService(
         ScpiPointConfig point,
         CancellationToken cancellationToken)
     {
+        var pointLease = lifecycleGate is null
+            ? null
+            : await lifecycleGate.TryAcquireRuntimeAsync(target.Mapping.RedisKey, cancellationToken);
+        await using var pointLeaseCleanup = pointLease;
+        if (lifecycleGate is not null && pointLease is null)
+        {
+            return CommandOperationOutcome.Failed(
+                CommandFailureReasonNames.OwnershipReleasing,
+                "Point ownership release is in progress.");
+        }
+
         var currentClaim = await ownership.ClaimAsync(
             target.Mapping.SourcePath,
             target.Mapping.RedisKey,
@@ -481,6 +512,17 @@ public sealed class CommandExecutionService(
         runtime.ReportRuntimeDiagnostic("command", command.CommandId, errorCode, errorMessage);
         await SafeLogAsync("Warning", $"Command '{command.CommandId}' failed: {errorMessage}", command.CommandId, cancellationToken);
         return new CommandDispatchResult("failed", errorMessage, command.CommandId);
+    }
+
+    private async Task<bool> FindNonterminalReleaseAsync(
+        string redisKey,
+        CancellationToken cancellationToken)
+    {
+        await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
+        return await db.PointOwnershipReleaseIntents.AsNoTracking().AnyAsync(
+            item => item.RedisKey == redisKey
+                && item.Status != PointOwnershipReleaseStatuses.Applied,
+            cancellationToken);
     }
 
     private async Task<string?> ReadPointTypeOrNullAsync(

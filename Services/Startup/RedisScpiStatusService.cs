@@ -2,20 +2,21 @@ using Microsoft.Extensions.Options;
 using Ptlk.RedisScpi.Configuration;
 using Ptlk.RedisScpi.Contracts.Redis;
 using Ptlk.RedisScpi.Services.Redis;
+using Ptlk.SCADA.Interop.Runtime;
 
 namespace Ptlk.RedisScpi.Services.Startup;
 
 public sealed class RedisScpiStatusService(
     RuntimeModeService runtime,
     EdgeStatePublisher edgeState,
+    EdgeRuntimeIdentity runtimeIdentity,
+    PointOwnershipReleaseRuntimeState releaseState,
     RedisPointOwnershipService ownership,
     RedisReconciliationService reconciliation,
     IOptions<RedisScpiOptions> redisScpiOptions,
     IOptions<RedisScpiRuntimeOptions> runtimeOptions,
     ILogger<RedisScpiStatusService> logger) : BackgroundService
 {
-    private readonly string instanceId = Guid.NewGuid().ToString("N");
-
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         await PublishAsync("RedisProtocolConverter.online", "online", stoppingToken);
@@ -53,7 +54,7 @@ public sealed class RedisScpiStatusService(
             var runtimeDiagnostics = current.RuntimeDiagnostics;
             var metadata = new Dictionary<string, string?>
             {
-                ["instanceId"] = instanceId,
+                ["instanceId"] = runtimeIdentity.InstanceId,
                 ["mode"] = current.Mode.ToString(),
                 ["message"] = current.Message,
                 ["redisConnected"] = BoolText(current.RedisConnected),
@@ -82,17 +83,23 @@ public sealed class RedisScpiStatusService(
                 ["ownershipAcquired"] = claims.Count(claim => claim.Acquired).ToString(),
                 ["ownershipNotAcquired"] = claims.Count(claim => !claim.Acquired).ToString()
             };
+            PointOwnershipReleaseRuntimeState.AddMetadata(metadata, releaseState.Current);
+            var effectiveStatus = status != "offline" && releaseState.Current.NeedsAttention > 0
+                ? "error"
+                : status;
             var evt = new RedisProtocolConverterStatusEventContract(
                 Schema: 1,
                 Type: type,
                 MessageId: Guid.NewGuid().ToString("N"),
                 ConverterId: options.ConverterId,
-                Status: status,
+                Status: effectiveStatus,
                 Timestamp: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 Source: options.SourceName,
                 Metadata: metadata);
 
             await edgeState.PublishAsync(evt, runtimeOptions.Value.HeartbeatIntervalMs, cancellationToken);
+            if (status != "offline")
+                runtimeIdentity.MarkOnlinePublished();
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

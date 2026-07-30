@@ -3,12 +3,16 @@ using Microsoft.Extensions.Options;
 using Ptlk.RedisScpi.Configuration;
 using Ptlk.RedisScpi.Data;
 using Ptlk.RedisScpi.Services.Redis;
+using Ptlk.RedisScpi.Services.Ownership;
+using Ptlk.SCADA.Interop.Runtime;
 
 namespace Ptlk.RedisScpi.Services.Startup;
 
 public sealed class RedisPointOwnershipHostedService(
     IDbContextFactory<AppDbContext> dbFactory,
     RedisPointOwnershipService ownership,
+    PointOwnershipReleaseCoordinator releases,
+    PointRuntimeLifecycleGate lifecycleGate,
     RuntimeModeService runtime,
     IOptions<RedisScpiOptions> options,
     ILogger<RedisPointOwnershipHostedService> logger) : BackgroundService
@@ -17,6 +21,7 @@ public sealed class RedisPointOwnershipHostedService(
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        await releases.InitialPassCompleted.WaitAsync(stoppingToken);
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -47,6 +52,8 @@ public sealed class RedisPointOwnershipHostedService(
                 ownership.RetainClaims(activeMappings.Select(mapping => mapping.SourcePath));
                 foreach (var mapping in activeMappings)
                 {
+                    if (lifecycleGate.IsReleasing(mapping.RedisKey))
+                        continue;
                     await ownership.EnsureOwnedAsync(mapping.SourcePath, mapping.RedisKey, stoppingToken);
                 }
 

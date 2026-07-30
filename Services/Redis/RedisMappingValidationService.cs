@@ -4,6 +4,7 @@ using Ptlk.RedisScpi.Contracts.Redis;
 using Ptlk.RedisScpi.Data;
 using Ptlk.RedisScpi.Models;
 using Ptlk.RedisScpi.Services.Paths;
+using Ptlk.RedisScpi.Services.Ownership;
 using Ptlk.RedisScpi.Services.Scpi;
 using Ptlk.SCADA.Interop.PointValues;
 using StackExchange.Redis;
@@ -26,7 +27,8 @@ public sealed record RedisMappingRuntimeIssue(
 public sealed class RedisMappingValidationService(
     IDbContextFactory<AppDbContext> dbFactory,
     RedisConnectionFactory redis,
-    RedisMappingActivationService? activation = null)
+    RedisMappingActivationService? activation = null,
+    PointOwnershipReleaseIntentService? releases = null)
 {
     private static readonly RedisValue[] RequiredPointFields =
     [
@@ -176,6 +178,23 @@ public sealed class RedisMappingValidationService(
             {
                 await EnsurePointCanLoseMappingAsync(db, mapping.SourcePath, cancellationToken);
             }
+
+            var normalizedRedisKey = redisKey.Trim();
+            if (releases is not null && !mapping.RedisKey.Equals(normalizedRedisKey, StringComparison.Ordinal))
+            {
+                await EnsurePointCanLoseMappingAsync(db, mapping.SourcePath, cancellationToken);
+                await transaction.RollbackAsync(cancellationToken);
+                await releases.RequestRemapAsync(
+                    mapping.Id,
+                    normalizedSourcePath,
+                    normalizedRedisKey,
+                    cancellationToken);
+                return new RedisMapping
+                {
+                    SourcePath = normalizedSourcePath,
+                    RedisKey = normalizedRedisKey
+                };
+            }
         }
         mapping.SourcePath = sourcePath.Trim();
         mapping.RedisKey = redisKey.Trim();
@@ -229,6 +248,13 @@ public sealed class RedisMappingValidationService(
         }
 
         await EnsurePointCanLoseMappingAsync(db, mapping.SourcePath, cancellationToken);
+        if (releases is not null)
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            _ = await releases.RequestDeleteAsync(id, cancellationToken);
+            return;
+        }
+
         db.RedisMappings.Remove(mapping);
         try
         {
