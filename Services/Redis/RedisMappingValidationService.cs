@@ -5,11 +5,15 @@ using Ptlk.RedisScpi.Data;
 using Ptlk.RedisScpi.Models;
 using Ptlk.RedisScpi.Services.Paths;
 using Ptlk.RedisScpi.Services.Scpi;
+using Ptlk.SCADA.Interop.PointValues;
 using StackExchange.Redis;
 
 namespace Ptlk.RedisScpi.Services.Redis;
 
-public sealed record MappingValidationResult(bool Success, string? Error);
+public sealed record MappingValidationResult(
+    bool Success,
+    string? Error,
+    PointMappingActivationResult? Activation = null);
 
 public sealed record RedisMappingKeyCheckResult(string SourcePath, string RedisKey);
 
@@ -21,7 +25,8 @@ public sealed record RedisMappingRuntimeIssue(
 
 public sealed class RedisMappingValidationService(
     IDbContextFactory<AppDbContext> dbFactory,
-    RedisConnectionFactory redis)
+    RedisConnectionFactory redis,
+    RedisMappingActivationService? activation = null)
 {
     private static readonly RedisValue[] RequiredPointFields =
     [
@@ -121,7 +126,21 @@ public sealed class RedisMappingValidationService(
                 $"SourcePath '{normalizedSourcePath}' does not match any SCPI point.");
         }
 
-        return new MappingValidationResult(true, null);
+        if (activation is null)
+        {
+            return new MappingValidationResult(true, null);
+        }
+
+        var activationResult = await activation.EvaluateAsync(
+            normalizedSourcePath,
+            normalizedRedisKey,
+            cancellationToken);
+        return new MappingValidationResult(
+            true,
+            activationResult.CanActivate
+                ? null
+                : $"{activationResult.DiagnosticCode}: {activationResult.DiagnosticMessage}",
+            activationResult);
     }
 
     public async Task<RedisMapping> CreateOrUpdateAsync(
@@ -297,6 +316,23 @@ public sealed class RedisMappingValidationService(
                     "missing_mapping",
                     $"Enabled SCPI point '{point.SourcePath}' has no Redis mapping."));
                 continue;
+            }
+
+            if (activation is not null)
+            {
+                var activationResult = await activation.EvaluateAsync(
+                    mapping.SourcePath,
+                    mapping.RedisKey,
+                    cancellationToken);
+                if (!activationResult.CanActivate)
+                {
+                    issues.Add(new RedisMappingRuntimeIssue(
+                        mapping.SourcePath,
+                        mapping.RedisKey,
+                        activationResult.DiagnosticCode ?? PointValueDiagnosticCodes.MappingTypeIncompatible,
+                        activationResult.DiagnosticMessage ?? "Mapping is inactive."));
+                    continue;
+                }
             }
 
             var issue = await ValidateRedisPointAsync(database, mapping, cancellationToken);

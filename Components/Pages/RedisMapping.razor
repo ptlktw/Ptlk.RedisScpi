@@ -253,7 +253,7 @@ else
         {
             var result = await Mappings.ValidateAsync(model.SourcePath, model.RedisKey, model.Id == 0 ? null : model.Id, disposal.Token);
             validationSuccess = result.Success;
-            validationMessage = result.Success ? "Mapping validation passed." : result.Error;
+            validationMessage = result.Success ? FormatActivation(result) : result.Error;
         }
         catch (OperationCanceledException) when (disposal.IsCancellationRequested)
         {
@@ -287,7 +287,7 @@ else
                 disposal.Token);
             editing = false;
             await LoadAsync();
-            await Alerts.ShowAsync("RedisMapping applied.", ScreenAlertSeverity.Success, "Mapping saved");
+            await Alerts.ShowAsync(FormatActivation(result), ScreenAlertSeverity.Success, "Mapping saved");
         }
         catch (OperationCanceledException) when (disposal.IsCancellationRequested)
         {
@@ -298,6 +298,19 @@ else
             await Alerts.ShowAsync(ex.Message, ScreenAlertSeverity.Error, "Mapping save failed");
         }
         finally { saving = false; }
+    }
+
+    private static string FormatActivation(MappingValidationResult result)
+    {
+        if (result.Activation is null)
+        {
+            return "Mapping validation passed.";
+        }
+
+        var status = result.Activation.Status.ToString().ToLowerInvariant();
+        var guard = result.Activation.RequiresRuntimeGuard ? " Value-level runtime guard is required." : "";
+        var reason = result.Activation.DiagnosticMessage is null ? "" : $" {result.Activation.DiagnosticMessage}";
+        return $"Activation: {status}; source={result.Activation.SourcePointType}; point={result.Activation.TargetPointType}.{guard}{reason}";
     }
 
     private async Task DeleteAsync()

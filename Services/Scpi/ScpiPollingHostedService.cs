@@ -221,7 +221,7 @@ public sealed class ScpiPollingHostedService(
         foreach (var point in endpoint.Points.Where(point => point.Enabled && point.PollingEnabled))
         {
             mappings.TryGetValue(point.SourcePath, out var mapping);
-            await MarkPointBadAsync(endpoint, point, mapping, failure, exception, cancellationToken, preserveLastValue: true);
+            await MarkPointBadAsync(endpoint, point, mapping, failure, exception, cancellationToken);
             var interval = TimeSpan.FromMilliseconds(point.PollingIntervalMs ?? endpoint.PollingIntervalMs);
             _nextDue[point.SourcePath] = DateTimeOffset.UtcNow.Add(interval);
         }
@@ -233,8 +233,7 @@ public sealed class ScpiPollingHostedService(
         RedisMapping? mapping,
         ScpiFailureClassification failure,
         Exception exception,
-        CancellationToken cancellationToken,
-        bool preserveLastValue = false)
+        CancellationToken cancellationToken)
     {
         runtime.SetPolling(RuntimeSubsystemStatus.Degraded, $"Polling failed for '{point.SourcePath}'.");
         runtime.ReportRuntimeDiagnostic("polling", point.SourcePath, failure.ErrorCode, exception.Message);
@@ -246,8 +245,7 @@ public sealed class ScpiPollingHostedService(
             "poll",
             rawContext,
             failure.ErrorCode,
-            exception.Message,
-            preserveLastValue);
+            exception.Message);
 
         if (mapping is null || !reconciliation.IsReady)
         {

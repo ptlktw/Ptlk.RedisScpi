@@ -6,7 +6,10 @@ using Ptlk.RedisScpi.Contracts.Redis;
 using Ptlk.RedisScpi.Contracts.Scpi;
 using Ptlk.RedisScpi.Models;
 using Ptlk.RedisScpi.Services.Startup;
+using Ptlk.SCADA.Interop.PointValues;
+using Ptlk.SCADA.Interop.Redis;
 using StackExchange.Redis;
+using InteropRedisHashParseStatus = Ptlk.SCADA.Interop.Contracts.Redis.RedisHashParseStatus;
 
 namespace Ptlk.RedisScpi.Services.Redis;
 
@@ -221,65 +224,9 @@ public sealed class RedisPointStateService(
         }
 
         var entries = await database.HashGetAllAsync(key);
-        var fields = entries.ToDictionary(
-            entry => entry.Name.ToString(),
-            entry => entry.Value.ToString(),
-            StringComparer.Ordinal);
-        var diagnostics = new List<string>();
-        foreach (var requiredField in RequiredFields)
-        {
-            if (!fields.ContainsKey(requiredField))
-            {
-                diagnostics.Add($"required_field_missing:{requiredField}");
-            }
-        }
-
-        if (diagnostics.Count > 0)
-        {
-            return new RedisPointInspection(key, RedisPointInspectionStatus.Incomplete, null, diagnostics);
-        }
-
-        var quality = fields["quality"];
-        var type = fields["type"];
-        var source = fields["source"];
-        var access = fields["access"];
-        var unit = fields["unit"];
-        if (!IsCanonicalQuality(quality))
-        {
-            diagnostics.Add("required_field_invalid:quality");
-        }
-
-        if (!IsCanonicalType(type))
-        {
-            diagnostics.Add("required_field_invalid:type");
-        }
-
-        if (string.IsNullOrWhiteSpace(source))
-        {
-            diagnostics.Add("required_field_invalid:source");
-        }
-
-        if (!IsCanonicalAccess(access))
-        {
-            diagnostics.Add("required_field_invalid:access");
-        }
-
-        if (!TryParseNonNegativeLong(fields["timestamp"], out var timestamp))
-        {
-            diagnostics.Add("required_field_invalid:timestamp");
-        }
-
-        if (!TryParseNonNegativeLong(fields["version"], out var version))
-        {
-            diagnostics.Add("required_field_invalid:version");
-        }
-
-        JsonElement? value = null;
-        var hasValue = fields.TryGetValue("value", out var valueText);
-        if (hasValue && IsCanonicalType(type) && !TryParseValue(type, valueText!, out value))
-        {
-            diagnostics.Add("value_invalid");
-        }
+        var parsed = RedisHashParser.ParsePoint(key, entries);
+        var fields = parsed.RawFields;
+        var diagnostics = parsed.Diagnostics.ToList();
 
         var owner = fields.GetValueOrDefault("owner");
         var ownerSource = fields.GetValueOrDefault("owner_source");
@@ -296,26 +243,33 @@ public sealed class RedisPointStateService(
             }
         }
 
-        if (diagnostics.Count > 0)
+        if (parsed.ParseStatus != InteropRedisHashParseStatus.Complete || diagnostics.Count > 0)
         {
-            return new RedisPointInspection(key, RedisPointInspectionStatus.Invalid, null, diagnostics);
+            var status = parsed.ParseStatus == InteropRedisHashParseStatus.Incomplete
+                ? RedisPointInspectionStatus.Incomplete
+                : RedisPointInspectionStatus.Invalid;
+            return new RedisPointInspection(key, status, null, diagnostics);
         }
 
+        var canonical = PointValueCanonicalizer.ParseHash(
+            parsed.Type,
+            parsed.HasValueField,
+            parsed.ValueText).CanonicalValue!;
         return new RedisPointInspection(
             key,
             RedisPointInspectionStatus.Complete,
             new PointStateContract(
                 key,
-                value,
-                hasValue ? valueText : null,
-                hasValue,
-                quality,
-                type,
-                timestamp,
-                version,
-                source,
-                access,
-                unit,
+                canonical.JsonValue,
+                parsed.ValueText,
+                parsed.HasValueField,
+                parsed.Quality,
+                parsed.Type,
+                parsed.Timestamp,
+                parsed.Version,
+                parsed.Source,
+                parsed.Access,
+                parsed.Unit,
                 string.IsNullOrEmpty(owner) ? null : owner,
                 string.IsNullOrEmpty(ownerSource) ? null : ownerSource,
                 ownerAcquiredAt),
@@ -335,7 +289,6 @@ public sealed class RedisPointStateService(
     {
         ArgumentNullException.ThrowIfNull(mapping);
         ValidateRuntimeArguments(mapping, quality, source);
-        var normalizedValue = NormalizeValue(value);
         var now = timestamp ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var effectiveUpdateReason = updateReason == PointUpdateReasons.Acquisition && quality == ScpiQuality.Bad
             ? PointUpdateReasons.AcquisitionFailure
@@ -346,6 +299,16 @@ public sealed class RedisPointStateService(
             if (!inspection.IsComplete || inspection.State is null)
                 throw CreateUpdateException(mapping, "redis_output_failed", "point_state_invalid", $"Redis point key '{mapping.RedisKey}' is incomplete.");
             var current = inspection.State;
+            var normalized = PointValueCanonicalizer.ValidateJson(current.Type, value);
+            if (!normalized.Success)
+            {
+                throw new RedisPointStateException(
+                    ScpiErrorCodes.InvalidValueType,
+                    normalized.DiagnosticCode ?? PointValueDiagnosticCodes.ValueKindMismatch,
+                    mapping.RedisKey,
+                    normalized.DiagnosticMessage ?? "Point value normalization failed.");
+            }
+            var canonical = normalized.CanonicalValue!;
             var operationId = operationIdOverride
                 ?? (effectiveUpdateReason == PointUpdateReasons.CommandWrite
                     ? PointOperationId.CommandWrite(
@@ -358,8 +321,8 @@ public sealed class RedisPointStateService(
                     redisScpiOptions.Value.ConverterId,
                     current.Version,
                     operationId,
-                    normalizedValue.HasValue ? normalizedValue.HashValue : null,
-                    normalizedValue.JsonValue,
+                    current.Type,
+                    canonical.HashText,
                     quality,
                     now,
                     source,
@@ -382,9 +345,9 @@ public sealed class RedisPointStateService(
 
             var updated = current with
             {
-                Value = normalizedValue.JsonValue,
-                ValueText = normalizedValue.HasValue ? normalizedValue.HashValue : null,
-                HasValueField = normalizedValue.HasValue,
+                Value = canonical.JsonValue,
+                ValueText = canonical.HashText,
+                HasValueField = canonical.HasValue,
                 Quality = quality,
                 Timestamp = now,
                 Version = result.Version.Value,
@@ -394,6 +357,10 @@ public sealed class RedisPointStateService(
             return updated;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (RedisPointStateException)
         {
             throw;
         }
@@ -407,66 +374,6 @@ public sealed class RedisPointStateService(
                 ex);
         }
 
-    }
-
-    private static (bool HasValue, string HashValue, string Kind, JsonElement? JsonValue) NormalizeValue(JsonElement? value)
-    {
-        if (value is null || value.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
-        {
-            return (false, "", "null", null);
-        }
-
-        var element = value.Value;
-        return element.ValueKind switch
-        {
-            JsonValueKind.String => (true, element.GetString() ?? "", "string", element.Clone()),
-            JsonValueKind.Number => (true, element.GetRawText(), "number", element.Clone()),
-            JsonValueKind.True => (true, "true", "boolean", element.Clone()),
-            JsonValueKind.False => (true, "false", "boolean", element.Clone()),
-            _ => throw new RedisPointStateException(
-                ScpiErrorCodes.InvalidValueType,
-                "value_not_scalar",
-                "",
-                "Redis point values must be a JSON scalar or null.")
-        };
-    }
-
-    private static bool TryParseValue(string type, string valueText, out JsonElement? value)
-    {
-        value = null;
-        switch (type)
-        {
-            case "string":
-                value = JsonSerializer.SerializeToElement(valueText, RedisContractJson.WebOptions);
-                return true;
-            case "int":
-                if (long.TryParse(valueText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var integer))
-                {
-                    value = JsonSerializer.SerializeToElement(integer, RedisContractJson.WebOptions);
-                    return true;
-                }
-
-                return false;
-            case "double":
-                if (double.TryParse(valueText, NumberStyles.Float, CultureInfo.InvariantCulture, out var number)
-                    && double.IsFinite(number))
-                {
-                    value = JsonSerializer.SerializeToElement(number, RedisContractJson.WebOptions);
-                    return true;
-                }
-
-                return false;
-            case "bool":
-                if (bool.TryParse(valueText, out var boolean))
-                {
-                    value = JsonSerializer.SerializeToElement(boolean, RedisContractJson.WebOptions);
-                    return true;
-                }
-
-                return false;
-            default:
-                return false;
-        }
     }
 
     private void ValidateRuntimeArguments(RedisMapping mapping, string quality, string source)

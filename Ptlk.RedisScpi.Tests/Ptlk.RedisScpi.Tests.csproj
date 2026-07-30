@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Ptlk.RedisScpi.csproj" />
+    <ProjectReference Include="..\..\Ptlk.SCADA.Interop\Ptlk.SCADA.Interop\Ptlk.SCADA.Interop.csproj" />
   </ItemGroup>
 
 </Project>

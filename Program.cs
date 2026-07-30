@@ -39,6 +39,7 @@ builder.Services.AddSingleton<RedisConnectionFactory>();
 builder.Services.AddSingleton<RedisPubSubService>();
 builder.Services.AddSingleton<IRedisPubSubService>(provider => provider.GetRequiredService<RedisPubSubService>());
 builder.Services.AddSingleton<EdgeStatePublisher>();
+builder.Services.AddSingleton<RedisMappingActivationService>();
 builder.Services.AddSingleton<RedisPointOwnershipService>();
 builder.Services.AddSingleton<AtomicPointUpdateService>();
 builder.Services.AddSingleton<PointUpdateIdentity>();

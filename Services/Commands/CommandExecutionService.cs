@@ -10,6 +10,8 @@ using Ptlk.RedisScpi.Services.Logs;
 using Ptlk.RedisScpi.Services.Redis;
 using Ptlk.RedisScpi.Services.Scpi;
 using Ptlk.RedisScpi.Services.Startup;
+using Ptlk.SCADA.Interop.PointValues;
+using CommandResultEventContract = Ptlk.SCADA.Interop.Contracts.Redis.CommandResultEventContract;
 
 namespace Ptlk.RedisScpi.Services.Commands;
 
@@ -403,6 +405,16 @@ public sealed class CommandExecutionService(
         long version,
         CancellationToken cancellationToken)
     {
+        var state = await pointState.ReadAsync(command.Key, cancellationToken)
+            ?? throw new InvalidOperationException($"Redis point '{command.Key}' is unavailable after command completion.");
+        var pointType = PointValueCanonicalizer.NormalizePointType(state.Type)
+            ?? throw new InvalidOperationException($"Redis point '{command.Key}' has no canonical point type.");
+        var canonical = PointValueCanonicalizer.ValidateJson(pointType, actualValue);
+        if (!canonical.Success)
+        {
+            throw new InvalidOperationException(
+                $"{canonical.DiagnosticCode}: {canonical.DiagnosticMessage}");
+        }
         var result = new CommandResultEventContract(
             1,
             "command.completed",
@@ -410,7 +422,8 @@ public sealed class CommandExecutionService(
             command.CommandId,
             command.Key,
             true,
-            actualValue.Clone(),
+            pointType,
+            canonical.CanonicalValue!.JsonValue,
             version,
             null,
             null,
@@ -438,6 +451,7 @@ public sealed class CommandExecutionService(
         JsonElement? diagnosticActualValue = null,
         long? diagnosticVersion = null)
     {
+        var pointType = await ReadPointTypeOrNullAsync(command.Key, cancellationToken);
         var result = new CommandResultEventContract(
             1,
             "command.failed",
@@ -445,6 +459,7 @@ public sealed class CommandExecutionService(
             command.CommandId,
             command.Key,
             false,
+            pointType,
             null,
             null,
             errorCode,
@@ -466,6 +481,21 @@ public sealed class CommandExecutionService(
         runtime.ReportRuntimeDiagnostic("command", command.CommandId, errorCode, errorMessage);
         await SafeLogAsync("Warning", $"Command '{command.CommandId}' failed: {errorMessage}", command.CommandId, cancellationToken);
         return new CommandDispatchResult("failed", errorMessage, command.CommandId);
+    }
+
+    private async Task<string?> ReadPointTypeOrNullAsync(
+        string key,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return PointValueCanonicalizer.NormalizePointType(
+                (await pointState.ReadAsync(key, cancellationToken))?.Type);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private async Task SaveTerminalAsync(

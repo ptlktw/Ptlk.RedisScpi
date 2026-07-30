@@ -84,16 +84,14 @@ public sealed class ScpiValueCache
         string operation,
         string? rawResponse,
         string errorCode,
-        string errorMessage,
-        bool preserveLastValue = false)
+        string errorMessage)
     {
-        var previous = preserveLastValue ? Get(sourcePath) : null;
         return Set(new ScpiCachedValue(
             sourcePath,
             endpointId,
             pointId,
-            previous?.Value,
-            previous?.RedisValue,
+            null,
+            null,
             Contracts.Scpi.ScpiQuality.Bad,
             DateTimeOffset.UtcNow,
             operation,

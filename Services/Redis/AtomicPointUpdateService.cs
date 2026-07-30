@@ -3,7 +3,9 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using Ptlk.SCADA.Interop.PointValues;
 using StackExchange.Redis;
+using ValueUpdatedEventContract = Ptlk.SCADA.Interop.Contracts.Redis.ValueUpdatedEventContract;
 
 namespace Ptlk.RedisScpi.Services.Redis;
 
@@ -60,7 +62,7 @@ public static class PointOperationId
     }
 }
 
-public sealed record AtomicPointUpdateRequest(string Key, string ExpectedOwner, long ExpectedVersion, string OperationId, string? Value, JsonElement? EventValue, string Quality, long Timestamp, string Source, string UpdateReason);
+public sealed record AtomicPointUpdateRequest(string Key, string ExpectedOwner, long ExpectedVersion, string OperationId, string PointType, string? Value, string Quality, long Timestamp, string Source, string UpdateReason);
 public sealed record AtomicPointUpdateResult(string Status, long? Version = null, string? Detail = null)
 {
     public bool Succeeded => Status is "applied" or "already_applied";
@@ -78,6 +80,7 @@ public static class AtomicPointUpdateLua
         local owner = redis.call('HGET', KEYS[1], 'owner'); if not owner or owner == '' then return {'ownership_missing'} end
         if owner ~= ARGV[1] then return {'owned_by_other', owner} end
         local pointType = redis.call('HGET', KEYS[1], 'type'); if pointType ~= 'int' and pointType ~= 'double' and pointType ~= 'bool' and pointType ~= 'string' then return {'required_field_invalid','type'} end
+        if pointType ~= ARGV[11] then return {'type_mismatch', pointType} end
         local access = redis.call('HGET', KEYS[1], 'access'); if access ~= 'readonly' and access ~= 'readwrite' then return {'required_field_invalid','access'} end
         local quality = redis.call('HGET', KEYS[1], 'quality'); if quality ~= 'unset' and quality ~= 'good' and quality ~= 'uncertain' and quality ~= 'bad' then return {'required_field_invalid','quality'} end
         local timestamp = redis.call('HGET', KEYS[1], 'timestamp'); if not timestamp or (not string.match(timestamp, '^0$') and not string.match(timestamp, '^[1-9][0-9]*$')) then return {'required_field_invalid','timestamp'} end
@@ -97,19 +100,19 @@ public sealed class AtomicPointUpdateService(RedisConnectionFactory redis)
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     public async Task<AtomicPointUpdateResult> ApplyAsync(AtomicPointUpdateRequest request, CancellationToken cancellationToken = default)
     {
-        Validate(request);
+        var canonical = Validate(request);
         var nextVersion = checked(request.ExpectedVersion + 1);
-        var payload = JsonSerializer.Serialize(new { schema = 1, type = "value.updated", messageId = request.OperationId, key = request.Key, value = request.EventValue, quality = request.Quality, version = nextVersion, timestamp = request.Timestamp, source = request.Source, updateReason = request.UpdateReason }, JsonOptions);
+        var payload = JsonSerializer.Serialize(new ValueUpdatedEventContract(1, "value.updated", request.OperationId, request.Key, canonical.PointType, canonical.JsonValue, request.Quality, nextVersion, request.Timestamp, request.Source, request.UpdateReason), JsonOptions);
         var result = (RedisResult[]?)await (await redis.GetDatabaseAsync(cancellationToken)).ScriptEvaluateAsync(
             AtomicPointUpdateLua.Script,
             [request.Key, "evt:value-updated"],
-            [request.ExpectedOwner, request.ExpectedVersion.ToString(CultureInfo.InvariantCulture), request.OperationId, request.Value is null ? "0" : "1", request.Value ?? "", request.Quality, request.Timestamp.ToString(CultureInfo.InvariantCulture), request.Source, payload, nextVersion.ToString(CultureInfo.InvariantCulture)]);
+            [request.ExpectedOwner, request.ExpectedVersion.ToString(CultureInfo.InvariantCulture), request.OperationId, canonical.HasValue ? "1" : "0", canonical.HashText ?? "", request.Quality, request.Timestamp.ToString(CultureInfo.InvariantCulture), request.Source, payload, nextVersion.ToString(CultureInfo.InvariantCulture), canonical.PointType]);
         var status = result is { Length: > 0 } ? result[0].ToString() ?? "unexpected_result" : "unexpected_result";
         var version = result is { Length: > 1 } && long.TryParse(result[1].ToString(), NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) ? parsed : (long?)null;
         return new(status, version, status is "applied" or "already_applied" ? null : result is { Length: > 1 } ? result[1].ToString() : null);
     }
 
-    private static void Validate(AtomicPointUpdateRequest request)
+    private static CanonicalPointValue Validate(AtomicPointUpdateRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
         if (string.IsNullOrWhiteSpace(request.Key) || string.IsNullOrWhiteSpace(request.ExpectedOwner) || request.ExpectedVersion < 0 || request.Timestamp < 0 || string.IsNullOrWhiteSpace(request.Source) || !PointUpdateReasons.IsKnown(request.UpdateReason))
@@ -118,26 +121,9 @@ public sealed class AtomicPointUpdateService(RedisConnectionFactory redis)
             throw new ArgumentException("OperationId must be 32 lowercase hexadecimal characters.", nameof(request));
         if (request.Quality is not ("unset" or "good" or "uncertain" or "bad"))
             throw new ArgumentException("Quality is not canonical.", nameof(request));
-        ValidateValuePair(request.Value, request.EventValue);
-    }
-
-    private static void ValidateValuePair(string? redisValue, JsonElement? eventValue)
-    {
-        if (redisValue is null)
-        {
-            if (eventValue is not null) throw new ArgumentException("A missing Redis value requires a null event value.");
-            return;
-        }
-        if (eventValue is null) throw new ArgumentException("A Redis value requires an event value.");
-        var canonicalEventValue = eventValue.Value.ValueKind switch
-        {
-            JsonValueKind.String => eventValue.Value.GetString(),
-            JsonValueKind.Number => eventValue.Value.GetRawText(),
-            JsonValueKind.True => "true",
-            JsonValueKind.False => "false",
-            _ => throw new ArgumentException("Event value must be a JSON string, number, or boolean.")
-        };
-        if (!string.Equals(redisValue, canonicalEventValue, StringComparison.Ordinal))
-            throw new ArgumentException("Redis value and event value must represent the same canonical value.");
+        var normalized = PointValueCanonicalizer.ParseHash(request.PointType, request.Value is not null, request.Value);
+        return normalized.Success
+            ? normalized.CanonicalValue!
+            : throw new ArgumentException($"{normalized.DiagnosticCode}: {normalized.DiagnosticMessage}", nameof(request));
     }
 }

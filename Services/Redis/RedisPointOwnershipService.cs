@@ -3,6 +3,7 @@ using System.Globalization;
 using Microsoft.Extensions.Options;
 using Ptlk.RedisScpi.Configuration;
 using Ptlk.RedisScpi.Services.Startup;
+using Ptlk.SCADA.Interop.PointValues;
 using StackExchange.Redis;
 
 namespace Ptlk.RedisScpi.Services.Redis;
@@ -19,7 +20,8 @@ public sealed class RedisPointOwnershipService(
     RedisConnectionFactory redis,
     IOptions<RedisScpiOptions> options,
     RuntimeModeService runtime,
-    ILogger<RedisPointOwnershipService> logger)
+    ILogger<RedisPointOwnershipService> logger,
+    RedisMappingActivationService? activation = null)
 {
     private static readonly TimeSpan ClaimRefreshInterval = TimeSpan.FromSeconds(5);
 
@@ -63,7 +65,6 @@ public sealed class RedisPointOwnershipService(
         {
             return false;
         }
-
         return _claims.TryGetValue(sourcePath, out var claim) && claim.Acquired;
     }
 
@@ -75,6 +76,15 @@ public sealed class RedisPointOwnershipService(
         if (!RequiresOwnership(sourcePath))
         {
             return false;
+        }
+        if (activation is not null)
+        {
+            var activationResult = await activation.EvaluateAsync(sourcePath, redisKey, cancellationToken);
+            if (!activationResult.CanActivate)
+            {
+                StoreInactive(sourcePath, redisKey, activationResult);
+                return false;
+            }
         }
 
         var now = DateTimeOffset.UtcNow;
@@ -117,6 +127,14 @@ public sealed class RedisPointOwnershipService(
                 "unsupported_source",
                 null,
                 DateTimeOffset.UtcNow));
+        }
+        if (activation is not null)
+        {
+            var activationResult = await activation.EvaluateAsync(sourcePath, redisKey, cancellationToken);
+            if (!activationResult.CanActivate)
+            {
+                return StoreInactive(sourcePath, redisKey, activationResult);
+            }
         }
 
         try
@@ -222,6 +240,35 @@ public sealed class RedisPointOwnershipService(
         {
             NotifyChanged();
         }
+        return claim;
+    }
+
+    private PointOwnershipClaimResult StoreInactive(
+        string sourcePath,
+        string redisKey,
+        PointMappingActivationResult activationResult)
+    {
+        var claim = Store(new PointOwnershipClaimResult(
+            sourcePath,
+            redisKey,
+            false,
+            activationResult.DiagnosticCode ?? PointValueDiagnosticCodes.MappingTypeIncompatible,
+            null,
+            DateTimeOffset.UtcNow));
+        runtime.ReportRedisOutputDiagnostic(
+            "mapping_activation",
+            sourcePath,
+            redisKey,
+            claim.Status,
+            activationResult.DiagnosticMessage ?? "Mapping is inactive.");
+        logger.LogWarning(
+            "RedisScpi mapping is inactive for {SourcePath} -> {RedisKey}; code={Code}; sourceType={SourceType}; pointType={PointType}; reason={Reason}.",
+            sourcePath,
+            redisKey,
+            claim.Status,
+            activationResult.SourcePointType,
+            activationResult.TargetPointType,
+            activationResult.DiagnosticMessage);
         return claim;
     }
 

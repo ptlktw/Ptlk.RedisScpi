@@ -21,7 +21,9 @@ using Ptlk.RedisScpi.Services.Paths;
 using Ptlk.RedisScpi.Services.Redis;
 using Ptlk.RedisScpi.Services.Scpi;
 using Ptlk.RedisScpi.Services.Startup;
+using Ptlk.SCADA.Interop.PointValues;
 using StackExchange.Redis;
+using CommandResultEventContract = Ptlk.SCADA.Interop.Contracts.Redis.CommandResultEventContract;
 
 var tests = new List<(string Name, Func<Task> Run)>
 {
@@ -42,7 +44,8 @@ var tests = new List<(string Name, Func<Task> Run)>
     ("Browser snapshot separates local and Redis state", BrowserSnapshotSeparationAsync),
     ("Runtime state exposes subsystem diagnostics", RunSync(RuntimeStateDiagnostics)),
     ("Command retention preserves accepted rows", CommandRetentionAsync),
-    ("Canonical JSON ignores object property order", RunSync(CanonicalJsonNormalization))
+    ("Canonical JSON ignores object property order", RunSync(CanonicalJsonNormalization)),
+    ("Mapping activation distinguishes number and enum ranges", RunSync(MappingActivationDistinguishesNumberAndEnumRanges))
 };
 
 if (string.Equals(Environment.GetEnvironmentVariable("REDIS_SCPI_INTEGRATION"), "1", StringComparison.Ordinal))
@@ -79,6 +82,31 @@ static Func<Task> RunSync(Action action) => () =>
     return Task.CompletedTask;
 };
 
+static void MappingActivationDistinguishesNumberAndEnumRanges()
+{
+    AssertEqual(
+        PointMappingActivationStatus.RuntimeGuard,
+        RedisMappingActivationService.EvaluateScpiType(
+            ScpiDataTypes.Number,
+            ScpiNumberTypes.Int,
+            null,
+            "double")!.Status);
+    AssertEqual(
+        PointMappingActivationStatus.Active,
+        RedisMappingActivationService.EvaluateScpiType(
+            ScpiDataTypes.Enum,
+            null,
+            ScpiEnumFormats.Code,
+            "double")!.Status);
+    var incompatible = RedisMappingActivationService.EvaluateScpiType(
+        ScpiDataTypes.String,
+        null,
+        null,
+        "int")!;
+    AssertEqual(PointMappingActivationStatus.Inactive, incompatible.Status);
+    AssertEqual(PointValueDiagnosticCodes.MappingTypeIncompatible, incompatible.DiagnosticCode);
+}
+
 static void PointOperationGoldenVectors()
 {
     AssertEqual("609b97d27e2751289fb73b8faa381621", PointOperationId.Create("ptlk-point-operation-v1", "acquisition", "instance-01", "42", "point:site/device/temp"));
@@ -99,14 +127,17 @@ static async Task AtomicPointUpdateIntegrationAsync()
     var key = $"point:codex/phase3/scpi-{Guid.NewGuid():N}";
     var queue = await connection.GetSubscriber().SubscribeAsync(RedisChannel.Literal("evt:value-updated"));
     var eventCount = 0;
+    var eventPayloads = new ConcurrentQueue<string>();
     queue.OnMessage(message =>
     {
         try
         {
-            using var document = JsonDocument.Parse(message.Message.ToString());
+            var payload = message.Message.ToString();
+            using var document = JsonDocument.Parse(payload);
             if (document.RootElement.TryGetProperty("key", out var eventKey)
                 && string.Equals(eventKey.GetString(), key, StringComparison.Ordinal))
             {
+                eventPayloads.Enqueue(payload);
                 Interlocked.Increment(ref eventCount);
             }
         }
@@ -126,8 +157,8 @@ static async Task AtomicPointUpdateIntegrationAsync()
         var service = new AtomicPointUpdateService(redis);
         var operation = PointOperationId.Create("ptlk-point-operation-v1", "acquisition", "instance-review", "1", key);
         var request = new AtomicPointUpdateRequest(
-            key, "phase3-scpi", initialVersion, operation, "12.5",
-            JsonSerializer.SerializeToElement(12.5), "good", 1793059200000, "redis-scpi", "acquisition");
+            key, "phase3-scpi", initialVersion, operation, "double", "12.5",
+            "good", 1793059200000, "redis-scpi", "acquisition");
         AssertEqual("applied", (await service.ApplyAsync(request)).Status);
         AssertEqual("already_applied", (await service.ApplyAsync(request)).Status);
         var nextOperation = PointOperationId.Create("ptlk-point-operation-v1", "acquisition", "instance-review", "2", key);
@@ -136,7 +167,6 @@ static async Task AtomicPointUpdateIntegrationAsync()
             ExpectedVersion = initialVersion + 1,
             OperationId = nextOperation,
             Value = "13.5",
-            EventValue = JsonSerializer.SerializeToElement(13.5),
             Timestamp = 1793059200001
         })).Status);
         AssertEqual("stale_conflict", (await service.ApplyAsync(request)).Status);
@@ -171,6 +201,48 @@ static async Task AtomicPointUpdateIntegrationAsync()
         AssertEqual(
             PointOperationId.CommandWrite(configuredConverterId, "scpi-command-review", key),
             (await db.HashGetAsync(key, "last_update_operation_id")).ToString());
+
+        var beforeInvalidVersion = (await db.HashGetAsync(key, "version")).ToString();
+        var rejected = false;
+        try
+        {
+            await service.ApplyAsync(request with
+            {
+                ExpectedOwner = configuredConverterId,
+                ExpectedVersion = initialVersion + 3,
+                OperationId = Guid.NewGuid().ToString("N"),
+                Value = "14.50",
+                Timestamp = 1793059200002
+            });
+        }
+        catch (ArgumentException)
+        {
+            rejected = true;
+        }
+        AssertTrue(rejected, "Non-canonical producer value must be rejected before Redis mutation.");
+        await Task.Delay(50);
+        AssertEqual(beforeInvalidVersion, (await db.HashGetAsync(key, "version")).ToString());
+        AssertEqual(3, eventCount);
+
+        var unavailable = await service.ApplyAsync(request with
+        {
+            ExpectedOwner = configuredConverterId,
+            ExpectedVersion = initialVersion + 3,
+            OperationId = PointOperationId.Create("ptlk-point-operation-v1", "acquisition_failure", "instance-review", "3", key),
+            Value = null,
+            Quality = ScpiQuality.Bad,
+            Timestamp = 1793059200003,
+            UpdateReason = PointUpdateReasons.AcquisitionFailure
+        });
+        AssertEqual("applied", unavailable.Status);
+        await Task.Delay(100);
+        AssertTrue((await db.HashGetAsync(key, "value")).IsNull, "Source-unavailable update must remove Hash value.");
+        AssertEqual(4, eventCount);
+        AssertTrue(
+            eventPayloads.All(payload => Ptlk.SCADA.Interop.Redis.RedisContractValidator.ValidateValueUpdated(payload).IsValid),
+            "Every SCPI value event must satisfy the shared Redis contract.");
+        using var unavailableEvent = JsonDocument.Parse(eventPayloads.Last());
+        AssertEqual(JsonValueKind.Null, unavailableEvent.RootElement.GetProperty("value").ValueKind);
     }
     finally
     {
@@ -197,9 +269,8 @@ static void ScpiCacheOutageBoundaryAndFailureScope()
         "poll",
         null,
         ScpiErrorCodes.TransportError,
-        "connection lost",
-        preserveLastValue: true);
-    AssertEqual("9.5", failed.RedisValue);
+        "connection lost");
+    AssertEqual<string?>(null, failed.RedisValue);
     AssertEqual(ScpiQuality.Bad, failed.Quality);
     AssertTrue(failed.Sequence > initial.Sequence, "Endpoint failure transition must advance the sequence.");
     var repeated = cache.SetBad(
@@ -209,8 +280,7 @@ static void ScpiCacheOutageBoundaryAndFailureScope()
         "poll",
         null,
         ScpiErrorCodes.TransportError,
-        "connection lost",
-        preserveLastValue: true);
+        "connection lost");
     AssertEqual(failed.Sequence, repeated.Sequence);
 
     var snapshot = cache.SnapshotForReconciliation();
@@ -1522,6 +1592,14 @@ static async Task CommandFlowIntegrationAsync()
         {
             AssertFalse(await db.CommandExecutions.AnyAsync(item => item.CommandId == ignored.CommandId), "Non-owner must not claim or publish a command result.");
         }
+        var commandPayloads = captured.Messages
+            .Where(item => item.Channel == RedisContractNames.CommandResultChannel)
+            .Select(item => item.Json)
+            .ToList();
+        AssertTrue(commandPayloads.Count > 0, "Command integration must capture terminal command results.");
+        AssertTrue(
+            commandPayloads.All(payload => Ptlk.SCADA.Interop.Redis.RedisContractValidator.ValidateCommandResult(payload).IsValid),
+            "Every SCPI command result must satisfy the shared typed contract.");
     }
     finally
     {
@@ -1935,6 +2013,7 @@ sealed class CapturingPubSubService : IRedisPubSubService
 
     public IReadOnlyList<object> Objects => _messages.Where(item => item.Payload is not null).Select(item => item.Payload!).ToList();
     public IReadOnlyList<string> RawPayloads => _messages.Where(item => item.IsRaw).Select(item => item.Json).ToList();
+    public IReadOnlyList<CapturedPublish> Messages => _messages.ToList();
     public int TotalCount => _messages.Count;
 
     public Task PublishAsync(string channel, object payload, CancellationToken cancellationToken = default)
