@@ -14,8 +14,10 @@ using Ptlk.RedisScpi.Services.Scpi;
 using Ptlk.RedisScpi.Services.Startup;
 using Ptlk.RedisScpi.Services.Ui;
 using Ptlk.SCADA.Interop.Runtime;
+using Ptlk.Web.Hosting;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddPtlkPublicWebHosting(builder.Configuration, builder.Environment, "redis-scpi");
 
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
@@ -99,6 +101,7 @@ builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
 
 var app = builder.Build();
+app.UsePtlkPublicPathBase();
 
 await using (var scope = app.Services.CreateAsyncScope())
 {

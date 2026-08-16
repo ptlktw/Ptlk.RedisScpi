@@ -22,6 +22,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Ptlk.SCADA.Interop\Ptlk.SCADA.Interop\Ptlk.SCADA.Interop.csproj" />
+    <ProjectReference Include="..\Ptlk.Web.Hosting\Ptlk.Web.Hosting.csproj" />
   </ItemGroup>
 
   <ItemGroup>

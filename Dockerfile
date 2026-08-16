@@ -5,6 +5,7 @@ RUN mkdir -p /data
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 COPY ["src/Ptlk.SCADA.Interop/Ptlk.SCADA.Interop/Ptlk.SCADA.Interop.csproj", "src/Ptlk.SCADA.Interop/Ptlk.SCADA.Interop/"]
+COPY ["src/Ptlk.Web.Hosting/Ptlk.Web.Hosting.csproj", "src/Ptlk.Web.Hosting/"]
 COPY ["src/Ptlk.RedisScpi/Ptlk.RedisScpi.csproj", "src/Ptlk.RedisScpi/"]
 RUN --mount=type=secret,id=ptlk_ca,required=false \
     if [ -s /run/secrets/ptlk_ca ]; then \
@@ -13,6 +14,7 @@ RUN --mount=type=secret,id=ptlk_ca,required=false \
       && rm -f /tmp/ptlk-build-ca-bundle.crt; \
     else dotnet restore "src/Ptlk.RedisScpi/Ptlk.RedisScpi.csproj"; fi
 COPY ["src/Ptlk.SCADA.Interop/Ptlk.SCADA.Interop/", "src/Ptlk.SCADA.Interop/Ptlk.SCADA.Interop/"]
+COPY ["src/Ptlk.Web.Hosting/", "src/Ptlk.Web.Hosting/"]
 COPY ["src/Ptlk.RedisScpi/", "src/Ptlk.RedisScpi/"]
 WORKDIR "/src/src/Ptlk.RedisScpi"
 RUN dotnet publish "Ptlk.RedisScpi.csproj" -c Release -o /app/publish --no-restore /p:UseAppHost=false
